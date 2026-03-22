@@ -1,0 +1,45 @@
+# Core dependencies
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+matplotlib>=3.7
+seaborn>=0.12
+plotly>=5.15
+ipython
+openpyxl
+streamlit
+numba
+
+# RL
+stable-baselines3>=2.1
+torch>=2.0
+gymnasium>=0.29            # Solo para spaces, NO para entornos
+modal
+runpod
+
+# Portfolio optimization
+cvxpy>=1.3                 # Para optimización convexa (min variance, etc.)
+pyportfolioopt
+
+# Cluster Analysis
+hdbscan
+
+# Regime analysis
+scikit-learn>=1.3
+hmmlearn # Install separately if needed, may require Python <3.13
+
+# Quantitative analysis
+quantstats # Install separately if compatible with your Python version
+
+# Data handling
+pyarrow>=12.0              # Para parquet
+pyyaml>=6.0                # Para configs
+
+# Testing
+pytest>=7.0
+pytest-cov
+
+# Development
+black
+isort
+mypy

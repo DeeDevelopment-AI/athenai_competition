@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-meta-allocator"
+version = "0.1.0"
+description = "RL Meta-Allocator sobre Algoritmos Caja Negra"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Carlos Diaz"}
+]
+keywords = ["reinforcement-learning", "portfolio-optimization", "finance", "meta-allocator"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "plotly>=5.15",
+    "stable-baselines3>=2.1",
+    "torch>=2.0",
+    "gymnasium>=0.29",
+    "cvxpy>=1.3",
+    "hmmlearn>=0.3",
+    "scikit-learn>=1.3",
+    "pyarrow>=12.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "black",
+    "isort",
+    "mypy",
+]
+analysis = [
+    "quantstats>=0.0.62",
+    "pypfopt>=1.5",
+]
+
+[project.scripts]
+run-analysis = "scripts.run_analysis:main"
+run-baselines = "scripts.run_baselines:main"
+train-agent = "scripts.train_agent:main"
+evaluate = "scripts.evaluate:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --cov=src --cov-report=term-missing"

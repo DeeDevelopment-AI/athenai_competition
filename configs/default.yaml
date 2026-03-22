@@ -1,0 +1,55 @@
+# configs/default.yaml
+# Configuración por defecto del RL Meta-Allocator
+
+data:
+  raw_path: "data/raw/"
+  processed_path: "data/processed/"
+  frequency: "daily"           # o "weekly"
+
+benchmark:
+  analyze_first: true
+
+features:
+  rolling_windows: [5, 21, 63, 126, 252]
+  regime_method: "hmm"         # "hmm" o "heuristic"
+  n_regimes: 3
+
+constraints:
+  max_weight_per_algo: 0.40
+  min_weight_per_algo: 0.00
+  max_turnover_per_rebalance: 0.30
+  max_total_exposure: 1.0
+  rebalance_frequency: "weekly"
+  target_volatility: null      # Calibrar al benchmark si se desea
+
+costs:
+  fixed_cost_per_trade: 0.0
+  spread_bps: 5.0
+  slippage_bps: 2.0
+  impact_coefficient: 0.1
+
+reward:
+  type: "alpha_penalized"      # "alpha_penalized", "info_ratio", "risk_adjusted"
+  cost_penalty: 1.0
+  turnover_penalty: 0.1
+  drawdown_penalty: 0.5
+  risk_penalty: 0.2
+  tracking_error_penalty: 0.0
+
+training:
+  total_timesteps: 500000
+  eval_frequency: 10000
+  n_eval_episodes: 5
+  seed: 42
+
+evaluation:
+  walk_forward:
+    train_window: 252
+    val_window: 63
+    test_window: 63
+    step_size: 63
+    expanding: false
+
+logging:
+  level: "INFO"
+  save_path: "outputs/logs/"

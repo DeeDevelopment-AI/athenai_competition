@@ -1,0 +1,30 @@
+allocation_by_regime:
+  early_long_persistent:
+    bear: 0.18582719250738378
+    bull: 0.2133337545518326
+    crisis: 0.14262802913362552
+    volatile_bull: 0.20403619642104345
+  late_short:
+    bear: 0.04555568223520131
+    bull: 0.04486216601562399
+    crisis: 0.018326692327184774
+    volatile_bull: 0.037208096942701656
+  noise:
+    bear: 0.7683709776810043
+    bull: 0.7392694402722233
+    crisis: 0.838739770039423
+    volatile_bull: 0.7542982275205699
+cluster_names:
+- early_short_persistent
+- noise
+- early_long_persistent
+- early_medium_persistent
+- late_short
+clustering_version: two_layer
+n_algo_clusters: 5
+regime_method: heuristic
+regime_names:
+- bear
+- crisis
+- bull
+- volatile_bull
