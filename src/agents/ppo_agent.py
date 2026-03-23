@@ -16,6 +16,7 @@ from .base import BaseAgent, TrainingMetrics
 from .callbacks import (
     CSVLoggerCallback,
     FinancialMetricsCallback,
+    NaNDetectionCallback,
     ProgressCallback,
     create_eval_callback,
 )
@@ -99,8 +100,15 @@ class PPOAllocator(BaseAgent):
 
         policy_kwargs = {
             "net_arch": dict(pi=net_arch, vf=net_arch),
-            "activation_fn": th.nn.ReLU,
-            "ortho_init": True,
+            # Tanh bounds pre-activations — critical with obs_dim=54055 where input
+            # L2 norm can reach ~2300, causing ReLU networks to produce NaN on first
+            # gradient step (gradient explosion through unbounded activations).
+            "activation_fn": th.nn.Tanh,
+            # ortho_init scales by sqrt(2)*gain; with 54055-dim input this produces
+            # pre-activation magnitudes >>100 before any training — disable it.
+            "ortho_init": False,
+            # Small initial log_std → lower action variance → stable first rollout
+            "log_std_init": -1.0,
         }
 
         self.model = PPO(
@@ -191,6 +199,15 @@ class PPOAllocator(BaseAgent):
                 verbose=self.verbose,
             )
             callback_list.append(progress_callback)
+
+        # NaN detection — stops training and saves emergency checkpoint instead of
+        # crashing at the next train() call after a full wasted rollout.
+        nan_callback = NaNDetectionCallback(
+            check_freq=eval_freq,
+            save_path=save_path,
+            verbose=self.verbose,
+        )
+        callback_list.append(nan_callback)
 
         # Add user callbacks
         if callbacks:

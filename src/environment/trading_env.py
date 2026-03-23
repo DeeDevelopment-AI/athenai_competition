@@ -344,24 +344,38 @@ class VecTradingEnv:
     Wrapper para crear entornos vectorizados.
 
     Útil para entrenamiento paralelo con SB3.
+    Usa SubprocVecEnv (true parallelism) cuando use_subproc=True.
     """
 
     def __init__(
         self,
         n_envs: int,
+        use_subproc: bool = False,
         **env_kwargs,
     ):
         """
         Args:
             n_envs: Número de entornos paralelos.
+            use_subproc: If True, use SubprocVecEnv (true parallelism via subprocesses).
+                         Requires the environment and its data to be picklable.
+                         Recommended when n_envs > 4 and on Linux (fork).
             **env_kwargs: Argumentos para TradingEnvironment.
         """
-        from stable_baselines3.common.vec_env import DummyVecEnv
+        import functools
 
-        self.envs = DummyVecEnv([
-            lambda: TradingEnvironment(**env_kwargs)
-            for _ in range(n_envs)
-        ])
+        def _make_env(kwargs: dict):
+            return TradingEnvironment(**kwargs)
+
+        env_fns = [functools.partial(_make_env, env_kwargs) for _ in range(n_envs)]
+
+        if use_subproc and n_envs > 1:
+            from stable_baselines3.common.vec_env import SubprocVecEnv
+            self.envs = SubprocVecEnv(env_fns)
+            logger.info(f"VecTradingEnv: {n_envs} envs using SubprocVecEnv (true parallelism)")
+        else:
+            from stable_baselines3.common.vec_env import DummyVecEnv
+            self.envs = DummyVecEnv(env_fns)
+            logger.info(f"VecTradingEnv: {n_envs} envs using DummyVecEnv (serial)")
 
     def __getattr__(self, name: str) -> Any:
         """Delega atributos al VecEnv interno."""

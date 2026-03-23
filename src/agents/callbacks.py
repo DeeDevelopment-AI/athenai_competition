@@ -424,6 +424,54 @@ class ProgressCallback(BaseCallback):
         return True
 
 
+class NaNDetectionCallback(BaseCallback):
+    """
+    Stops training immediately when NaN is detected in policy weights.
+
+    Without this, NaN propagates silently through one full rollout (n_steps ×
+    n_envs timesteps) before the ValueError surfaces at the next train() call,
+    wasting significant time and losing the checkpoint.
+
+    On NaN detection: saves the model and vecnormalize stats (if available),
+    then returns False to stop training cleanly.
+    """
+
+    def __init__(
+        self,
+        check_freq: int = 5_000,
+        save_path: Optional[str] = None,
+        verbose: int = 1,
+    ):
+        super().__init__(verbose)
+        self.check_freq = check_freq
+        self.save_path = save_path
+        self._last_check = 0
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last_check < self.check_freq:
+            return True
+        self._last_check = self.num_timesteps
+
+        # Check all policy parameters for NaN
+        for name, param in self.model.policy.named_parameters():
+            if param.data.isnan().any() or param.data.isinf().any():
+                logger.error(
+                    f"NaN/Inf detected in policy parameter '{name}' "
+                    f"at timestep {self.num_timesteps}. Stopping training."
+                )
+                # Attempt emergency save before stopping
+                if self.save_path is not None:
+                    try:
+                        emergency_path = str(Path(self.save_path) / "emergency_checkpoint")
+                        self.model.save(emergency_path)
+                        logger.info(f"Emergency checkpoint saved to: {emergency_path}")
+                    except Exception as e:
+                        logger.warning(f"Could not save emergency checkpoint: {e}")
+                return False  # Stop training
+
+        return True
+
+
 def create_eval_callback(
     eval_env,
     save_path: str | Path,

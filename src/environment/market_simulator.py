@@ -2,6 +2,7 @@
 Motor de simulación de mercado event-driven.
 """
 
+import bisect
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -99,6 +100,10 @@ class MarketSimulator:
         self.n_algos = len(algo_returns.columns)
         self.algo_names = list(algo_returns.columns)
 
+        # Pre-compute numpy array of the DatetimeIndex for O(log n) searchsorted
+        # (avoids building a boolean mask over all rows on every get_observation call)
+        self._returns_index_np = algo_returns.index.values  # numpy array of datetime64
+
         # Estado
         self._state: Optional[SimulatorState] = None
         self._start_date: Optional[pd.Timestamp] = None
@@ -136,6 +141,8 @@ class MarketSimulator:
         # Generar fechas de rebalanceo
         self._rebalance_dates = self._generate_rebalance_dates()
         self._date_index = 0
+        # Pre-compute O(1) date lookups
+        self._dates_set = {d: i for i, d in enumerate(self._dates)}
 
         # Inicializar estado
         initial_weights = np.ones(self.n_algos) / self.n_algos  # Equal weight inicial
@@ -249,7 +256,7 @@ class MarketSimulator:
         self._state.benchmark_curve.append(self._state.benchmark_value)
         self._state.weights_history.append(new_weights.copy())
         self._state.dates.append(next_date)
-        self._date_index = self._dates.index(next_date)
+        self._date_index = self._dates_set.get(next_date, self._date_index)
 
         # 9. Verificar si terminó
         done = next_rebalance_idx >= len(self._rebalance_dates) - 1
@@ -275,12 +282,9 @@ class MarketSimulator:
         )
 
     def _find_next_rebalance_index(self) -> int:
-        """Encuentra índice de la siguiente fecha de rebalanceo."""
+        """Encuentra índice de la siguiente fecha de rebalanceo (O(log n) via bisect)."""
         current_date = self._state.current_date
-        for i, date in enumerate(self._rebalance_dates):
-            if date > current_date:
-                return i
-        return len(self._rebalance_dates)
+        return bisect.bisect_right(self._rebalance_dates, current_date)
 
     def _get_period_returns(
         self, start_date: pd.Timestamp, end_date: pd.Timestamp
@@ -311,35 +315,34 @@ class MarketSimulator:
             result = float(np.nanmean(period_returns))
             return 0.0 if np.isnan(result) else result
 
-        # Usar pesos del benchmark
+        # Usar pesos del benchmark — fully vectorized, no Python per-day loop
         mask = (self.algo_returns.index > start_date) & (self.algo_returns.index <= end_date)
         dates_in_period = self.algo_returns.index[mask]
 
-        total_return = 0.0
-        for date in dates_in_period:
-            if date in self.benchmark_weights.index:
-                weights = self.benchmark_weights.loc[date].values
-            else:
-                # Usar último peso conocido
-                prev_dates = self.benchmark_weights.index[self.benchmark_weights.index <= date]
-                if len(prev_dates) > 0:
-                    weights = self.benchmark_weights.loc[prev_dates[-1]].values
-                else:
-                    weights = np.ones(self.n_algos) / self.n_algos
+        if len(dates_in_period) == 0:
+            return 0.0
 
-            daily_return = self.algo_returns.loc[date].values
+        # Forward-fill benchmark weights to each date in period (O(log n) reindex)
+        bw_aligned = self.benchmark_weights.reindex(dates_in_period, method='ffill')
+        # Fall back to equal weight for any date still missing (before first bw entry)
+        if bw_aligned.isna().any(axis=None):
+            equal_w = np.ones(self.n_algos) / self.n_algos
+            bw_aligned = bw_aligned.apply(
+                lambda row: row.fillna(pd.Series(equal_w, index=bw_aligned.columns)),
+                axis=1,
+            )
 
-            # Handle NaN in weights and returns
-            weights = np.nan_to_num(weights, nan=0.0)
-            daily_return = np.nan_to_num(daily_return, nan=0.0)
+        bw_values = np.nan_to_num(bw_aligned.values, nan=0.0)  # (n_days, n_algos)
+        row_sums = bw_values.sum(axis=1, keepdims=True)
+        row_sums = np.where(row_sums > 0, row_sums, 1.0)
+        bw_values /= row_sums  # normalize each day's weights
 
-            # Normalize weights if needed
-            weight_sum = weights.sum()
-            if weight_sum > 0:
-                weights = weights / weight_sum
+        returns_period = np.nan_to_num(
+            self.algo_returns.loc[dates_in_period].values, nan=0.0
+        )  # (n_days, n_algos)
 
-            total_return += np.dot(weights, daily_return)
-
+        # Vectorized daily weighted return, summed over period
+        total_return = float((bw_values * returns_period).sum())
         return float(np.nan_to_num(total_return, nan=0.0))
 
     def _calculate_drawdown(self) -> float:
@@ -392,9 +395,11 @@ class MarketSimulator:
         current_date = self._state.current_date
         lookback = 21
 
-        # Obtener datos históricos
-        idx_mask = self.algo_returns.index <= current_date
-        historical = self.algo_returns.loc[idx_mask].tail(lookback)
+        # Obtener datos históricos — O(log n) via searchsorted instead of boolean mask
+        pos = self._returns_index_np.searchsorted(
+            np.datetime64(current_date), side='right'
+        )
+        historical = self.algo_returns.iloc[max(0, pos - lookback): pos]
 
         # Fill NaN with 0 for calculations
         historical_clean = historical.fillna(0.0)
@@ -425,13 +430,21 @@ class MarketSimulator:
         else:
             obs.extend([0.0] * self.n_algos)
 
-        # 4. Correlación media
-        if len(historical_clean) >= 10:
-            corr = historical_clean.corr().values
-            corr = np.nan_to_num(corr, nan=0.0)
-            triu_mask = np.triu(np.ones(corr.shape, dtype=bool), k=1)
-            corr_vals = corr[triu_mask]
-            avg_corr = corr_vals.mean() if len(corr_vals) > 0 else 0.0
+        # 4. Correlación media (sampled — computing full n_algos×n_algos corr matrix is
+        #    O(n^2) and allocates ~n^2*4 bytes every step; use 64-algo sample instead)
+        if len(historical_clean) >= 10 and self.n_algos >= 2:
+            _corr_sample_size = min(64, self.n_algos)
+            rng_indices = np.linspace(0, self.n_algos - 1, _corr_sample_size, dtype=int)
+            sampled = historical_clean.iloc[:, rng_indices].values.astype(np.float32)
+            # Vectorized correlation via normalized dot product
+            means = sampled.mean(axis=0, keepdims=True)
+            centered = sampled - means
+            norms = np.linalg.norm(centered, axis=0, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            normed = centered / norms
+            corr_matrix = normed.T @ normed  # (sample, sample)
+            n_s = _corr_sample_size
+            avg_corr = (corr_matrix.sum() - n_s) / max(n_s * (n_s - 1), 1)
             obs.append(float(np.nan_to_num(avg_corr, nan=0.0)))
         else:
             obs.append(0.0)

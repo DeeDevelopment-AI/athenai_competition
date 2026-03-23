@@ -107,7 +107,7 @@ class TD3Allocator(BaseAgent):
 
         policy_kwargs = {
             "net_arch": dict(pi=net_arch, qf=net_arch),
-            "activation_fn": th.nn.ReLU,
+            "activation_fn": th.nn.Tanh,  # Bounded — avoids NaN with large obs_dim
         }
 
         # Ruido de exploración

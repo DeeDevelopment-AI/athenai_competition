@@ -32,11 +32,16 @@ Options:
   --n-eval-episodes N  Episodes per evaluation (default: 5)
   --rebalance-freq F   Rebalance frequency (default: weekly)
   --seed N             Random seed (default: 42)
+  --max-resources      Auto-configure to fully use GPU/CPU/RAM (detects VRAM and sets
+                       n_envs, batch_size, net_arch, SubprocVecEnv automatically)
+  --n-envs N           Override number of parallel envs (default: 4)
+  --use-subproc        Use SubprocVecEnv for true process parallelism
 """
 
 import argparse
 import gc
 import json
+import os
 import sys
 import warnings
 from dataclasses import dataclass, asdict, field
@@ -68,7 +73,8 @@ class TrainingConfig:
     """Training configuration."""
     # Agent
     agent: str = "ppo"
-    learning_rate: float = 3e-4
+    # Reduced from 3e-4: with obs_dim=54055 and VecNormalize, 1e-4 is more stable
+    learning_rate: float = 1e-4
     net_arch: List[int] = field(default_factory=lambda: [256, 256])
 
     # Training
@@ -115,6 +121,97 @@ def parse_timesteps(value: str) -> int:
         return int(float(value[:-1]) * 1_000_000)
     else:
         return int(value)
+
+
+def detect_hardware() -> dict:
+    """Detect available GPU VRAM, RAM, and CPU cores."""
+    import logging
+    log = logging.getLogger(__name__)
+
+    info = {
+        "gpu_available": False,
+        "gpu_vram_gb": 0.0,
+        "gpu_name": "none",
+        "ram_gb": 8.0,
+        "cpu_count": os.cpu_count() or 4,
+    }
+
+    # RAM
+    try:
+        import psutil
+        info["ram_gb"] = psutil.virtual_memory().total / 1e9
+    except ImportError:
+        pass
+
+    # GPU
+    try:
+        import torch
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            info["gpu_available"] = True
+            info["gpu_vram_gb"] = props.total_memory / 1e9
+            info["gpu_name"] = props.name
+    except Exception:
+        pass
+
+    log.info(
+        f"Hardware detected: GPU={info['gpu_name']} ({info['gpu_vram_gb']:.0f} GB VRAM), "
+        f"RAM={info['ram_gb']:.0f} GB, CPU={info['cpu_count']} cores"
+    )
+    return info
+
+
+def build_max_resources_config(hw: dict, agent: str) -> dict:
+    """
+    Return hyperparameter overrides to maximize hardware utilization.
+
+    Tiers based on GPU VRAM:
+      >= 80 GB : massive config (n_envs=64, batch=8192, net=[1024,512,256])
+      >= 40 GB : large config  (n_envs=32, batch=4096, net=[512,512])
+      >= 16 GB : medium config (n_envs=16, batch=2048, net=[512,256])
+      CPU only : cpu config    (n_envs=cpu//2, batch=512, net=[256,256])
+    """
+    vram = hw["gpu_vram_gb"]
+    cpu = hw["cpu_count"]
+
+    if vram >= 80:
+        n_envs, batch_size, n_steps = 64, 8192, 8192
+        net_arch = [1024, 512, 256]
+        buf_size, grad_steps = 2_000_000, 16
+    elif vram >= 40:
+        n_envs, batch_size, n_steps = 32, 4096, 4096
+        net_arch = [512, 512]
+        buf_size, grad_steps = 1_000_000, 8
+    elif vram >= 16:
+        n_envs, batch_size, n_steps = 16, 2048, 4096
+        net_arch = [512, 256]
+        buf_size, grad_steps = 500_000, 4
+    else:
+        # CPU-only: parallelism via SubprocVecEnv with many envs
+        n_envs = max(4, cpu // 2)
+        batch_size, n_steps = 512, 2048
+        net_arch = [256, 256]
+        buf_size, grad_steps = 200_000, 2
+
+    cfg: dict = {
+        "n_envs": n_envs,
+        "use_subproc": True,
+        "net_arch": net_arch,
+    }
+
+    if agent in ("ppo", "all"):
+        cfg.update({
+            "ppo_n_steps": n_steps,
+            "ppo_batch_size": batch_size,
+        })
+    if agent in ("sac", "td3", "all"):
+        cfg.update({
+            "off_policy_batch_size": batch_size,
+            "buffer_size": buf_size,
+            "gradient_steps": grad_steps,
+        })
+
+    return cfg
 
 
 # =============================================================================
@@ -164,8 +261,8 @@ class Phase5Runner(PhaseRunner):
             help='Random seed'
         )
         parser.add_argument(
-            '--learning-rate', type=float, default=3e-4,
-            help='Learning rate'
+            '--learning-rate', type=float, default=1e-4,
+            help='Learning rate (default: 1e-4; 3e-4 causes NaN with 13k-dim action space)'
         )
         parser.add_argument(
             '--input-dir', type=str, default=None,
@@ -174,6 +271,22 @@ class Phase5Runner(PhaseRunner):
         parser.add_argument(
             '--resume', type=str, default=None,
             help='Path to checkpoint to resume from'
+        )
+        parser.add_argument(
+            '--max-resources', action='store_true',
+            help=(
+                'Auto-configure hyperparameters to maximally use available GPU/CPU/RAM. '
+                'Detects VRAM, RAM, and CPU cores to set n_envs, batch_size, net_arch. '
+                'Uses SubprocVecEnv for true parallelism.'
+            )
+        )
+        parser.add_argument(
+            '--n-envs', type=int, default=None,
+            help='Override number of parallel environments (default: 4, or auto with --max-resources)'
+        )
+        parser.add_argument(
+            '--use-subproc', action='store_true',
+            help='Use SubprocVecEnv for true process-level parallelism'
         )
 
     def run(self, args: argparse.Namespace) -> dict:
@@ -188,6 +301,32 @@ class Phase5Runner(PhaseRunner):
         # Parse timesteps
         total_timesteps = parse_timesteps(args.timesteps)
 
+        # --max-resources: detect hardware and override hyperparameters
+        n_envs = args.n_envs or 4
+        use_subproc = args.use_subproc
+        ppo_n_steps = 2048
+        ppo_batch_size = 64
+        off_policy_batch_size = 256
+        buffer_size = 100_000
+        gradient_steps = 1
+        net_arch = [256, 256]
+
+        if args.max_resources:
+            hw = detect_hardware()
+            mr = build_max_resources_config(hw, args.agent)
+            n_envs = mr["n_envs"]
+            use_subproc = mr["use_subproc"]
+            net_arch = mr["net_arch"]
+            ppo_n_steps = mr.get("ppo_n_steps", ppo_n_steps)
+            ppo_batch_size = mr.get("ppo_batch_size", ppo_batch_size)
+            off_policy_batch_size = mr.get("off_policy_batch_size", off_policy_batch_size)
+            buffer_size = mr.get("buffer_size", buffer_size)
+            gradient_steps = mr.get("gradient_steps", gradient_steps)
+            self.logger.info(
+                f"Max-resources mode: n_envs={n_envs}, subproc={use_subproc}, "
+                f"ppo_batch={ppo_batch_size}, net_arch={net_arch}"
+            )
+
         # Build config
         config = TrainingConfig(
             agent=args.agent,
@@ -197,6 +336,7 @@ class Phase5Runner(PhaseRunner):
             rebalance_frequency=args.rebalance_freq,
             seed=args.seed,
             learning_rate=args.learning_rate,
+            net_arch=net_arch,
         )
 
         results = {
@@ -299,7 +439,8 @@ class Phase5Runner(PhaseRunner):
 
             # Training environment (vectorized)
             train_env = VecTradingEnv(
-                n_envs=4,
+                n_envs=n_envs,
+                use_subproc=use_subproc,
                 algo_returns=algo_returns,
                 benchmark_weights=benchmark_weights,
                 train_start=train_dates[0],
@@ -313,7 +454,7 @@ class Phase5Runner(PhaseRunner):
                 reward_scale=config.reward_scale,
             )
 
-            # Evaluation environment (validation period)
+            # Evaluation environment (validation period, always DummyVecEnv)
             eval_episode_config = EpisodeConfig(
                 random_start=False,
                 episode_length=config.episode_length,
@@ -321,6 +462,7 @@ class Phase5Runner(PhaseRunner):
             )
             eval_env = VecTradingEnv(
                 n_envs=1,
+                use_subproc=False,
                 algo_returns=algo_returns,
                 benchmark_weights=benchmark_weights,
                 train_start=val_dates[0],
@@ -334,11 +476,33 @@ class Phase5Runner(PhaseRunner):
                 reward_scale=config.reward_scale,
             )
 
-            # Extract the underlying DummyVecEnv from the wrapper
+            from stable_baselines3.common.vec_env import VecNormalize
+
+            # Extract the underlying VecEnv from the wrapper
             train_vec_env = train_env.envs
             eval_vec_env = eval_env.envs
 
-            self.logger.info(f"Training env: {train_vec_env.num_envs} parallel envs")
+            # VecNormalize: normalize each obs feature to ~N(0,1) via running stats.
+            # Critical with obs_dim=54055 — raw obs L2 norm is ~2300, which causes
+            # NaN gradient explosion in the first backward pass without normalization.
+            train_vec_env = VecNormalize(
+                train_vec_env,
+                norm_obs=True,
+                norm_reward=True,
+                clip_obs=10.0,
+                gamma=0.99,
+            )
+            # Eval env shares obs stats from train (no stat updates during eval)
+            eval_vec_env = VecNormalize(
+                eval_vec_env,
+                norm_obs=True,
+                norm_reward=False,
+                clip_obs=10.0,
+                training=False,
+            )
+            eval_vec_env.obs_rms = train_vec_env.obs_rms
+
+            self.logger.info(f"Training env: {train_vec_env.num_envs} parallel envs (VecNormalize)")
             self.logger.info(f"Observation shape: {train_vec_env.observation_space.shape}")
             self.logger.info(f"Action shape: {train_vec_env.action_space.shape}")
 
@@ -362,6 +526,11 @@ class Phase5Runner(PhaseRunner):
                     config=config,
                     output_dir=output_dir,
                     resume_path=args.resume if agent_name == args.agent else None,
+                    ppo_n_steps=ppo_n_steps,
+                    ppo_batch_size=ppo_batch_size,
+                    off_policy_batch_size=off_policy_batch_size,
+                    buffer_size=buffer_size,
+                    gradient_steps=gradient_steps,
                 )
                 results['agents_trained'].append(agent_results)
 
@@ -384,6 +553,11 @@ class Phase5Runner(PhaseRunner):
         config: TrainingConfig,
         output_dir: Path,
         resume_path: Optional[str] = None,
+        ppo_n_steps: int = 2048,
+        ppo_batch_size: int = 64,
+        off_policy_batch_size: int = 256,
+        buffer_size: int = 100_000,
+        gradient_steps: int = 1,
     ) -> dict:
         """Train a single agent."""
         from src.agents.ppo_agent import PPOAllocator
@@ -400,13 +574,19 @@ class Phase5Runner(PhaseRunner):
             agent = PPOAllocator(
                 env=train_env,
                 learning_rate=config.learning_rate,
-                n_steps=2048,
-                batch_size=64,
+                n_steps=ppo_n_steps,
+                batch_size=ppo_batch_size,
                 n_epochs=10,
                 gamma=0.99,
                 gae_lambda=0.95,
                 clip_range=0.2,
-                ent_coef=0.01,
+                # ent_coef=0: with 13513 action dims the entropy of a Normal is ~12k nats,
+                # making entropy_loss ≈ -115 and dominating the policy gradient signal.
+                ent_coef=0.0,
+                vf_coef=0.25,   # Value fn already well-trained (expl_var≈0.97); reduce weight
+                # max_grad_norm=0.05: output layer has 13513×256=3.5M params; tighter clip
+                # prevents accumulated weight drift to NaN over hundreds of thousands of steps.
+                max_grad_norm=0.05,
                 net_arch=config.net_arch,
                 seed=config.seed,
             )
@@ -414,10 +594,11 @@ class Phase5Runner(PhaseRunner):
             agent = SACAllocator(
                 env=train_env,
                 learning_rate=config.learning_rate,
-                buffer_size=100_000,
-                batch_size=256,
+                buffer_size=buffer_size,
+                batch_size=off_policy_batch_size,
                 tau=0.005,
                 ent_coef='auto',
+                gradient_steps=gradient_steps,
                 net_arch=config.net_arch,
                 seed=config.seed,
             )
@@ -425,10 +606,11 @@ class Phase5Runner(PhaseRunner):
             agent = TD3Allocator(
                 env=train_env,
                 learning_rate=config.learning_rate,
-                buffer_size=100_000,
-                batch_size=256,
+                buffer_size=buffer_size,
+                batch_size=off_policy_batch_size,
                 tau=0.005,
                 policy_delay=2,
+                gradient_steps=gradient_steps,
                 net_arch=config.net_arch,
                 seed=config.seed,
             )
@@ -459,6 +641,13 @@ class Phase5Runner(PhaseRunner):
         final_path = agent_dir / "final_model"
         agent.save(final_path)
         self.logger.info(f"Saved final model to: {final_path}")
+
+        # Save VecNormalize stats alongside the model so they can be restored on load
+        from stable_baselines3.common.vec_env import VecNormalize
+        if isinstance(train_env, VecNormalize):
+            norm_path = agent_dir / "vecnormalize.pkl"
+            train_env.save(str(norm_path))
+            self.logger.info(f"Saved VecNormalize stats to: {norm_path}")
 
         # Get training metrics
         metrics = agent.get_training_metrics()

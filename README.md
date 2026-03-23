@@ -97,7 +97,7 @@ Profile algorithms, reverse-engineer benchmark behavior, detect market regimes.
 ```bash
 # Algorithm pipeline (detailed asset inference)
 python notebooks/algo_pipeline.py \
-    --algos data/raw/algoritmos \
+    --algos data/raw/algorithms \
     --benchmarks notebooks/benchmarks \
     --output outputs/results
 
