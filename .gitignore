@@ -122,5 +122,4 @@ secrets/
 tmp/
 temp/
 *.tmp
-/notebooks/
 /data/
