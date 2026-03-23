@@ -941,6 +941,61 @@ def parallel_correlation_matrix(returns: np.ndarray) -> np.ndarray:
 
 
 # =============================================================================
+# Environment Hot-Path Kernels (Numba-optimized)
+# =============================================================================
+
+@njit(parallel=True, cache=True, fastmath=True)
+def compound_returns_2d(period: np.ndarray) -> np.ndarray:
+    """
+    Compound returns along axis=0 (rows=days, cols=algos), NaN treated as 0.
+
+    Equivalent to ``(1 + fillna(period, 0)).prod(axis=0) - 1`` but:
+    - Avoids the (n_days, n_algos) temporary allocation.
+    - Parallelized over columns (algos) for large universes (13k+ algos).
+
+    Args:
+        period: (n_days, n_algos) float32 array of daily returns (C-contiguous).
+
+    Returns:
+        (n_algos,) float32 compound returns.
+    """
+    n_days, n_algos = period.shape
+    result = np.empty(n_algos, dtype=np.float32)
+    for a in prange(n_algos):
+        prod = np.float32(1.0)
+        for d in range(n_days):
+            v = period[d, a]
+            if not np.isnan(v):
+                prod = prod * (np.float32(1.0) + v)
+        result[a] = prod - np.float32(1.0)
+    return result
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def weighted_sum_2d(weights: np.ndarray, values: np.ndarray) -> float:
+    """
+    Compute sum(weights * values) over a 2D array without a temporary allocation.
+
+    Parallelized over columns (algos). Useful for benchmark weighted returns.
+
+    Args:
+        weights: (n_days, n_algos) float32 normalized benchmark weights.
+        values:  (n_days, n_algos) float32 daily algo returns (NaN→0 pre-applied).
+
+    Returns:
+        Scalar weighted return sum.
+    """
+    n_days, n_algos = weights.shape
+    col_totals = np.zeros(n_algos, dtype=np.float32)
+    for a in prange(n_algos):
+        s = np.float32(0.0)
+        for d in range(n_days):
+            s += weights[d, a] * values[d, a]
+        col_totals[a] = s
+    return float(col_totals.sum())
+
+
+# =============================================================================
 # Utility Functions
 # =============================================================================
 
@@ -989,6 +1044,10 @@ def warm_up_jit():
         correlation_matrix(test_returns_2d)
         var_historical(test_arr)
         cvar_historical(test_arr)
+        # Environment hot-path kernels
+        test_period = np.random.randn(5, 10).astype(np.float32)
+        compound_returns_2d(test_period)
+        weighted_sum_2d(test_period, test_period)
         logger.debug("JIT warm-up completed")
     except Exception as e:
         logger.warning(f"JIT warm-up failed: {e}")

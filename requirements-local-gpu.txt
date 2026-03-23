@@ -1,0 +1,15 @@
+# ============================================================
+# requirements-local-gpu.txt — Local machine with NVIDIA GPU
+# Installs PyTorch with CUDA 12.4 support.
+# Compatible with driver >= 525 (RTX 4080 / driver 572.61 = CUDA 12.8 max)
+# Usage: pip install -r requirements-local-gpu.txt
+# ============================================================
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# Inherit all base deps
+-r requirements.txt
+
+# Override torch with CUDA 12.4 build
+torch
+torchvision
+torchaudio

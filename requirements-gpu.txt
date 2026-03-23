@@ -1,0 +1,15 @@
+# ============================================================
+# requirements-gpu.txt — GPU servers (RunPod, Colab, etc.)
+# Installs PyTorch with CUDA 13.0 support.
+# Required: NVIDIA driver >= 576 (RTX PRO 6000 Blackwell on RunPod)
+# Usage: pip install -r requirements-gpu.txt
+# ============================================================
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+# Inherit all base deps
+-r requirements.txt
+
+# Override torch with CUDA 13.0 build (RunPod RTX Pro 6000 Blackwell)
+torch==2.10.0+cu130
+torchvision
+torchaudio

@@ -101,15 +101,27 @@ class TrainingConfig:
     impact_coefficient: float = 0.1
 
     # Reward
+    # Calibración: alpha semanal típico ~0.1% → reward_scale=100 → señal ~0.10
+    # cost_penalty=1.0: incluye costes reales (7bps×turnover ≈ 0.01 escalado) — mantener
+    # turnover_penalty: penalización ADICIONAL sobre costes. Con 0.1 y max_turnover=0.30
+    #   la penalización (3.0 escalada) aplasta la señal (0.10). Reducir 20×.
+    # drawdown_penalty: con 0.5 y 5% DD excess, penalización (2.5 escalada) >> señal.
     reward_scale: float = 100.0
     cost_penalty: float = 1.0
-    turnover_penalty: float = 0.1
-    drawdown_penalty: float = 0.5
+    turnover_penalty: float = 0.005   # was 0.1 — 20× reduction to let agent learn to trade
+    drawdown_penalty: float = 0.1     # was 0.5 — proportional to alpha signal magnitude
 
     # Walk-forward
     train_ratio: float = 0.6
     val_ratio: float = 0.2
     test_ratio: float = 0.2
+
+    # Universe encoder (dimensionality reduction)
+    use_encoder: bool = True
+    use_family_encoder: bool = True   # True = FamilyEncoder (8-dim), False = PCA encoder
+    n_pca_components: int = 50
+    min_days_active: int = 21
+    n_families: int = 8
 
 
 def parse_timesteps(value: str) -> int:
@@ -193,9 +205,15 @@ def build_max_resources_config(hw: dict, agent: str) -> dict:
         net_arch = [256, 256]
         buf_size, grad_steps = 200_000, 2
 
+    # SubprocVecEnv uses fork on Linux (fast) but spawn on Windows (very slow —
+    # each subprocess re-imports Python, pickles the full DataFrame, and sends it
+    # over IPC).  On Windows, DummyVecEnv with more envs is faster overall.
+    import sys as _sys
+    use_subproc = _sys.platform != "win32"
+
     cfg: dict = {
         "n_envs": n_envs,
-        "use_subproc": True,
+        "use_subproc": use_subproc,
         "net_arch": net_arch,
     }
 
@@ -288,6 +306,30 @@ class Phase5Runner(PhaseRunner):
             '--use-subproc', action='store_true',
             help='Use SubprocVecEnv for true process-level parallelism'
         )
+        parser.add_argument(
+            '--no-encoder', action='store_true',
+            help='Disable AlgoUniverseEncoder (use raw 13k-dim obs/action spaces)'
+        )
+        parser.add_argument(
+            '--pca-components', type=int, default=50,
+            help='Number of PCA components for AlgoUniverseEncoder (default: 50)'
+        )
+        parser.add_argument(
+            '--min-days-active', type=int, default=21,
+            help='Min active days in training window for Stage 1 filter (default: 21)'
+        )
+        parser.add_argument(
+            '--pca-encoder', action='store_true',
+            help='Use PCA-based AlgoUniverseEncoder instead of FamilyEncoder (default: FamilyEncoder)'
+        )
+        parser.add_argument(
+            '--run-id', type=str, default=None,
+            help=(
+                'Identifier for this training run (default: auto YYYYMMDD_HHMMSS). '
+                'Outputs go to outputs/rl_training/{run_id}/. '
+                'Pass the same run-id to run_phase6.py --run-id to evaluate this specific run.'
+            )
+        )
 
     def run(self, args: argparse.Namespace) -> dict:
         """Execute Phase 5 pipeline."""
@@ -337,9 +379,38 @@ class Phase5Runner(PhaseRunner):
             seed=args.seed,
             learning_rate=args.learning_rate,
             net_arch=net_arch,
+            use_encoder=not args.no_encoder,
+            use_family_encoder=not getattr(args, 'pca_encoder', False),
+            n_pca_components=args.pca_components,
+            min_days_active=args.min_days_active,
         )
 
+        # ── Run ID: unique identifier for this training run ──────────────────
+        # Lets you keep multiple runs and always know which model was evaluated.
+        # Format: YYYYMMDD_HHMMSS  (or custom via --run-id)
+        from datetime import datetime as _dt
+        import json as _json
+
+        run_id = args.run_id or _dt.now().strftime("%Y%m%d_%H%M%S")
+        if args.agent != 'all':
+            # Suffix with agent name when training a single agent for clarity
+            run_id = f"{run_id}_{args.agent}"
+
+        # Output lives under outputs/rl_training/{run_id}/
+        rl_root = self.op.rl_training.root
+        output_dir = rl_root / run_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── latest_run.txt — Phase 6 reads this by default ───────────────────
+        latest_path = rl_root / "latest_run.txt"
+        latest_path.write_text(run_id)
+
+        self.logger.info(f"Run ID: {run_id}")
+        self.logger.info(f"Output: {output_dir}")
+        self.logger.info(f"Latest pointer updated: {latest_path}")
+
         results = {
+            'run_id': run_id,
             'mode': 'quick' if args.quick else 'standard',
             'config': asdict(config),
             'agents_trained': [],
@@ -347,7 +418,6 @@ class Phase5Runner(PhaseRunner):
 
         # Determine paths
         input_dir = Path(args.input_dir) if args.input_dir else self.dp.processed.root
-        output_dir = self.get_output_dir()
 
         # ==================================================================
         # STEP 5.1: LOAD DATA
@@ -403,10 +473,66 @@ class Phase5Runner(PhaseRunner):
             }
 
         # ==================================================================
+        # STEP 5.2.5: FIT UNIVERSE ENCODER
+        # ==================================================================
+        encoder = None
+        with self.step("5.2.5 Fit Universe Encoder"):
+            if config.use_encoder:
+                if config.use_family_encoder:
+                    from src.environment.universe_encoder import FamilyEncoder
+                    # Load pre-computed family labels (from Phase 2 behavioral clustering)
+                    family_labels_path = self.dp.processed.root / 'analysis' / 'clustering' / 'behavioral' / 'family_labels.csv'
+                    if not family_labels_path.exists():
+                        self.logger.warning(
+                            f"family_labels.csv not found at {family_labels_path}. "
+                            "Falling back to PCA encoder."
+                        )
+                        config.use_family_encoder = False
+                    else:
+                        import pandas as _pd
+                        family_df = _pd.read_csv(family_labels_path, index_col=0)
+                        # Column may be 'family' or first column
+                        fam_col = 'family' if 'family' in family_df.columns else family_df.columns[0]
+                        family_labels_series = family_df[fam_col].astype(int)
+                        encoder = FamilyEncoder(
+                            family_labels=family_labels_series,
+                            activity_window=63,
+                        )
+                        encoder.fit(algo_returns, train_dates[0], train_dates[1])
+                        stats = encoder.get_filter_stats()
+                        self.logger.info(
+                            f"FamilyEncoder: {stats['n_total_algos']} algos -> "
+                            f"{stats['n_families']} families, "
+                            f"obs_dim={stats['obs_dim']}, action_dim={stats['action_dim']}"
+                        )
+                        for fid, sz in stats['family_sizes'].items():
+                            self.logger.info(f"  Family {fid}: {sz} algos")
+                        results['encoder'] = stats
+
+                if not config.use_family_encoder:
+                    from src.environment.universe_encoder import AlgoUniverseEncoder
+                    encoder = AlgoUniverseEncoder(
+                        n_components=config.n_pca_components,
+                        min_days_active=config.min_days_active,
+                    )
+                    encoder.fit(algo_returns, train_dates[0], train_dates[1])
+                    stats = encoder.get_filter_stats()
+                    self.logger.info(
+                        f"PCA Encoder: {stats['n_total_algos']} algos -> "
+                        f"{stats['n_static_algos']} static -> "
+                        f"{stats['n_pca_components']} PCA components "
+                        f"({stats['pca_explained_variance']:.1%} var explained)"
+                    )
+                    results['encoder'] = stats
+            else:
+                self.logger.info("Universe encoder disabled (--no-encoder). Using raw dimensions.")
+                results['encoder'] = {"fitted": False}
+
+        # ==================================================================
         # STEP 5.3: CREATE ENVIRONMENTS
         # ==================================================================
         with self.step("5.3 Create Training Environments"):
-            from src.environment.trading_env import TradingEnvironment, EpisodeConfig, VecTradingEnv
+            from src.environment.trading_env import EpisodeConfig, VecTradingEnv
             from src.environment.cost_model import CostModel
             from src.environment.constraints import PortfolioConstraints
             from src.environment.reward import RewardFunction, RewardType
@@ -452,6 +578,7 @@ class Phase5Runner(PhaseRunner):
                 reward_function=reward_fn,
                 episode_config=episode_config,
                 reward_scale=config.reward_scale,
+                encoder=encoder,
             )
 
             # Evaluation environment (validation period, always DummyVecEnv)
@@ -474,6 +601,7 @@ class Phase5Runner(PhaseRunner):
                 reward_function=reward_fn,
                 episode_config=eval_episode_config,
                 reward_scale=config.reward_scale,
+                encoder=encoder,
             )
 
             from stable_baselines3.common.vec_env import VecNormalize
@@ -542,6 +670,49 @@ class Phase5Runner(PhaseRunner):
         # ==================================================================
         with self.step("5.5 Generate Report"):
             self._generate_report(results, output_dir)
+
+            # ── run_info.json: lightweight manifest for comparison ────────
+            # Captures the key settings so you can diff runs without reading logs.
+            run_info = {
+                "run_id": run_id,
+                "timestamp": run_id[:15],  # YYYYMMDD_HHMMSS prefix
+                "agents": [r["agent"] for r in results.get("agents_trained", [])],
+                "total_timesteps": config.total_timesteps,
+                "use_encoder": config.use_encoder,
+                "encoder_type": "family" if config.use_family_encoder else "pca",
+                "n_pca_components": config.n_pca_components,
+                "reward": {
+                    "scale": config.reward_scale,
+                    "cost_penalty": config.cost_penalty,
+                    "turnover_penalty": config.turnover_penalty,
+                    "drawdown_penalty": config.drawdown_penalty,
+                },
+                "training": {
+                    "learning_rate": config.learning_rate,
+                    "net_arch": config.net_arch,
+                    "n_envs": n_envs,
+                },
+                "validation": {
+                    a["agent"]: a.get("validation", {})
+                    for a in results.get("agents_trained", [])
+                },
+            }
+            run_info_path = output_dir / "run_info.json"
+            import json as _json
+            import numpy as _np
+
+            class _NumpyEncoder(_json.JSONEncoder):
+                def default(self, obj):
+                    if isinstance(obj, _np.integer):
+                        return int(obj)
+                    if isinstance(obj, _np.floating):
+                        return float(obj)
+                    if isinstance(obj, _np.ndarray):
+                        return obj.tolist()
+                    return super().default(obj)
+
+            run_info_path.write_text(_json.dumps(run_info, indent=2, cls=_NumpyEncoder))
+            self.logger.info(f"Run manifest: {run_info_path}")
 
         return results
 
@@ -648,6 +819,17 @@ class Phase5Runner(PhaseRunner):
             norm_path = agent_dir / "vecnormalize.pkl"
             train_env.save(str(norm_path))
             self.logger.info(f"Saved VecNormalize stats to: {norm_path}")
+
+        # Save encoder so it can be reloaded for inference / evaluation
+        import pickle
+        from stable_baselines3.common.vec_env import VecNormalize as _VN  # local alias
+        _inner = train_env.venv if isinstance(train_env, _VN) else train_env
+        _env0 = _inner.envs[0] if hasattr(_inner, 'envs') else None
+        if _env0 is not None and hasattr(_env0, 'encoder') and _env0.encoder is not None:
+            enc_path = agent_dir / "universe_encoder.pkl"
+            with open(enc_path, "wb") as f:
+                pickle.dump(_env0.encoder, f)
+            self.logger.info(f"Saved universe encoder to: {enc_path}")
 
         # Get training metrics
         metrics = agent.get_training_metrics()

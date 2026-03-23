@@ -15,6 +15,7 @@ from .constraints import PortfolioConstraints
 from .cost_model import CostModel
 from .market_simulator import MarketSimulator
 from .reward import RewardFunction
+from .universe_encoder import AlgoUniverseEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ class TradingEnvironment(gym.Env):
         reward_scale: float = 100.0,
         normalize_obs: bool = True,
         episode_config: Optional[EpisodeConfig] = None,
+        encoder: Optional[AlgoUniverseEncoder] = None,
     ):
         """
         Args:
@@ -72,6 +74,9 @@ class TradingEnvironment(gym.Env):
             reward_scale: Factor de escala para reward.
             normalize_obs: Si normalizar observaciones.
             episode_config: Configuration for episode sampling (walk-forward).
+            encoder: Optional fitted AlgoUniverseEncoder.  When provided, the
+                     observation/action spaces use the compressed PCA dimensions
+                     and observations/actions are encoded/decoded automatically.
         """
         super().__init__()
 
@@ -98,6 +103,7 @@ class TradingEnvironment(gym.Env):
         self.reward_scale = reward_scale
         self.normalize_obs = normalize_obs
         self.episode_config = episode_config or EpisodeConfig()
+        self.encoder = encoder
 
         self.n_algos = self.simulator.n_algos
 
@@ -105,9 +111,14 @@ class TradingEnvironment(gym.Env):
         self._available_dates = algo_returns.index.sort_values()
         self._setup_date_ranges()
 
-        # Definir espacios de observación y acción
-        # Observación: pesos + retornos + vols + métricas
-        obs_dim = self.n_algos * 4 + 3  # Aproximado, ajustar según get_observation
+        # Observation and action spaces — compressed when encoder is provided
+        if encoder is not None:
+            obs_dim = encoder.obs_dim
+            action_dim = encoder.action_dim
+        else:
+            obs_dim = self.n_algos * 4 + 3
+            action_dim = self.n_algos
+
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -115,12 +126,11 @@ class TradingEnvironment(gym.Env):
             dtype=np.float32,
         )
 
-        # Acción: pesos objetivo para cada algoritmo
-        # Rango [0, 1] que luego se normaliza
+        # Action range [0, 1] — normalized in step(); encoder decodes to full space
         self.action_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(self.n_algos,),
+            shape=(action_dim,),
             dtype=np.float32,
         )
 
@@ -249,11 +259,16 @@ class TradingEnvironment(gym.Env):
             end_date=self._episode_end,
         )
 
+        current_date = self.simulator._state.current_date
+
+        if self.encoder is not None:
+            obs = self.encoder.encode_obs(obs, current_date)
+
         if self.normalize_obs:
             obs = self._normalize_observation(obs)
 
         return obs, {
-            "date": self.simulator._state.current_date,
+            "date": current_date,
             "episode_start": self._episode_start,
             "episode_end": self._episode_end,
         }
@@ -268,17 +283,23 @@ class TradingEnvironment(gym.Env):
         Returns:
             Tuple (obs, reward, terminated, truncated, info).
         """
+        if self.encoder is not None:
+            # Decode PCA action → full algo weight vector before simulator
+            sim_action = self.encoder.decode_action(action, self.simulator._state.current_date)
+        else:
+            sim_action = action
+
         # Normalizar acción para que sume a 1 (o menos)
-        action = np.clip(action, 0, 1)
-        action_sum = action.sum()
+        sim_action = np.clip(sim_action, 0, 1)
+        action_sum = sim_action.sum()
         if action_sum > 1:
-            action = action / action_sum
+            sim_action = sim_action / action_sum
         elif action_sum == 0:
             # If all zeros, use equal weight
-            action = np.ones(len(action)) / len(action)
+            sim_action = np.ones(len(sim_action)) / len(sim_action)
 
         # Ejecutar paso en el simulador
-        result = self.simulator.step(action)
+        result = self.simulator.step(sim_action)
 
         self._steps_in_episode += 1
 
@@ -290,6 +311,8 @@ class TradingEnvironment(gym.Env):
 
         # Procesar observación
         obs = result.observation
+        if self.encoder is not None:
+            obs = self.encoder.encode_obs(obs, self.simulator._state.current_date)
         if self.normalize_obs:
             obs = self._normalize_observation(obs)
 

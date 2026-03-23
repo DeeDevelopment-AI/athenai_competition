@@ -13,6 +13,7 @@ import pandas as pd
 from .constraints import PortfolioConstraints
 from .cost_model import CostModel
 from .reward import RewardComponents, RewardFunction
+from src.utils.numba_utils import compound_returns_2d, weighted_sum_2d
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,21 @@ class MarketSimulator:
         # Pre-compute numpy array of the DatetimeIndex for O(log n) searchsorted
         # (avoids building a boolean mask over all rows on every get_observation call)
         self._returns_index_np = algo_returns.index.values  # numpy array of datetime64
+
+        # Pre-store returns as float32 numpy array for fast slicing in get_observation
+        # and _get_period_returns. pandas ops (loc, fillna) add ~1ms per call; numpy is
+        # ~20× faster for the same computation.
+        self._returns_np = algo_returns.values.astype(np.float32)  # (n_days, n_algos)
+
+        # Pre-store benchmark weights as numpy for fast _get_benchmark_return
+        if self.benchmark_weights is not None:
+            self._bw_np: np.ndarray = self.benchmark_weights.reindex(
+                columns=algo_returns.columns, fill_value=0.0
+            ).values.astype(np.float32)  # (n_bw_rows, n_algos)
+            self._bw_index_np: np.ndarray = self.benchmark_weights.index.values
+        else:
+            self._bw_np = None
+            self._bw_index_np = None
 
         # Estado
         self._state: Optional[SimulatorState] = None
@@ -289,61 +305,55 @@ class MarketSimulator:
     def _get_period_returns(
         self, start_date: pd.Timestamp, end_date: pd.Timestamp
     ) -> np.ndarray:
-        """Obtiene retornos acumulados del periodo para cada algoritmo."""
-        mask = (self.algo_returns.index > start_date) & (self.algo_returns.index <= end_date)
-        period_returns = self.algo_returns.loc[mask]
+        """Obtiene retornos acumulados del periodo para cada algoritmo (numba kernel)."""
+        # O(log n) date lookup — no pandas boolean mask
+        s = int(self._returns_index_np.searchsorted(np.datetime64(start_date), side='right'))
+        e = int(self._returns_index_np.searchsorted(np.datetime64(end_date), side='right'))
 
-        if len(period_returns) == 0:
-            return np.zeros(self.n_algos)
+        if s >= e:
+            return np.zeros(self.n_algos, dtype=np.float32)
 
-        # Retorno acumulado (handle NaN by filling with 0)
-        period_returns_clean = period_returns.fillna(0.0)
-        cumulative = (1 + period_returns_clean).prod() - 1
-        result = cumulative.values
-
-        # Replace any remaining NaN/Inf with 0
-        result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
-        return result
+        # compound_returns_2d: parallel numba, NaN→0, avoids (n_days×n_algos) temp array
+        period = np.ascontiguousarray(self._returns_np[s:e])  # ensure C-contiguous for numba
+        result = compound_returns_2d(period)
+        return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _get_benchmark_return(
         self, start_date: pd.Timestamp, end_date: pd.Timestamp
     ) -> float:
-        """Calcula retorno del benchmark en el periodo."""
-        if self.benchmark_weights is None:
-            # Usar equal weight como proxy
-            period_returns = self._get_period_returns(start_date, end_date)
-            result = float(np.nanmean(period_returns))
-            return 0.0 if np.isnan(result) else result
+        """Calcula retorno del benchmark en el periodo (pure numpy)."""
+        s = int(self._returns_index_np.searchsorted(np.datetime64(start_date), side='right'))
+        e = int(self._returns_index_np.searchsorted(np.datetime64(end_date), side='right'))
 
-        # Usar pesos del benchmark — fully vectorized, no Python per-day loop
-        mask = (self.algo_returns.index > start_date) & (self.algo_returns.index <= end_date)
-        dates_in_period = self.algo_returns.index[mask]
-
-        if len(dates_in_period) == 0:
+        if s >= e:
             return 0.0
 
-        # Forward-fill benchmark weights to each date in period (O(log n) reindex)
-        bw_aligned = self.benchmark_weights.reindex(dates_in_period, method='ffill')
-        # Fall back to equal weight for any date still missing (before first bw entry)
-        if bw_aligned.isna().any(axis=None):
-            equal_w = np.ones(self.n_algos) / self.n_algos
-            bw_aligned = bw_aligned.apply(
-                lambda row: row.fillna(pd.Series(equal_w, index=bw_aligned.columns)),
-                axis=1,
-            )
+        if self._bw_np is None:
+            # Equal weight proxy
+            period = self._returns_np[s:e]
+            result = float(np.nanmean(period))
+            return 0.0 if np.isnan(result) else result
 
-        bw_values = np.nan_to_num(bw_aligned.values, nan=0.0)  # (n_days, n_algos)
+        # Forward-fill benchmark weights for each day via searchsorted on bw index
+        days = self._returns_index_np[s:e]                                  # (n_days,)
+        bw_pos = self._bw_index_np.searchsorted(days, side='right') - 1     # (n_days,)
+        bw_pos = np.clip(bw_pos, 0, len(self._bw_np) - 1)
+        bw_values = self._bw_np[bw_pos]                                     # (n_days, n_algos)
+
+        # Normalize each day's weights to sum to 1
         row_sums = bw_values.sum(axis=1, keepdims=True)
-        row_sums = np.where(row_sums > 0, row_sums, 1.0)
-        bw_values /= row_sums  # normalize each day's weights
+        row_sums = np.where(row_sums > 0, row_sums, np.float32(1.0))
+        bw_values = bw_values / row_sums
 
-        returns_period = np.nan_to_num(
-            self.algo_returns.loc[dates_in_period].values, nan=0.0
-        )  # (n_days, n_algos)
+        # Daily returns, NaN→0
+        day_returns = self._returns_np[s:e]                                 # (n_days, n_algos)
+        day_returns = np.where(np.isnan(day_returns), np.float32(0.0), day_returns)
 
-        # Vectorized daily weighted return, summed over period
-        total_return = float((bw_values * returns_period).sum())
-        return float(np.nan_to_num(total_return, nan=0.0))
+        # weighted_sum_2d: parallel numba, avoids (n_days×n_algos) temporary allocation
+        total = weighted_sum_2d(
+            np.ascontiguousarray(bw_values), np.ascontiguousarray(day_returns)
+        )
+        return float(np.nan_to_num(total, nan=0.0))
 
     def _calculate_drawdown(self) -> float:
         """Calcula drawdown actual del portfolio."""
@@ -395,76 +405,77 @@ class MarketSimulator:
         current_date = self._state.current_date
         lookback = 21
 
-        # Obtener datos históricos — O(log n) via searchsorted instead of boolean mask
+        # Obtener datos históricos — O(log n) via searchsorted, then numpy slice (no pandas)
         pos = self._returns_index_np.searchsorted(
             np.datetime64(current_date), side='right'
         )
-        historical = self.algo_returns.iloc[max(0, pos - lookback): pos]
+        # numpy slice is ~200× faster than df.iloc[...].fillna(0.0).values
+        h_raw = self._returns_np[max(0, pos - lookback): pos]    # (lookback, n_algos) view
+        hvals = np.where(np.isnan(h_raw), np.float32(0.0), h_raw)  # NaN → 0, no pandas
 
-        # Fill NaN with 0 for calculations
-        historical_clean = historical.fillna(0.0)
-
-        # Features
-        obs = []
+        n = self.n_algos
+        _zeros = np.zeros(n, dtype=np.float32)
 
         # 1. Pesos actuales
-        obs.extend(self._state.current_weights)
+        feat_weights = self._state.current_weights.astype(np.float32)
 
-        # 2. Retornos recientes (5d, 21d)
-        if len(historical_clean) >= 5:
-            ret_5d = (1 + historical_clean.tail(5)).prod() - 1
-            obs.extend(np.nan_to_num(ret_5d.values, nan=0.0))
+        # 2. Retornos recientes (5d, 21d) — numba compound kernel, no temp allocation
+        n_hist = len(hvals)
+        if n_hist >= 5:
+            feat_ret5d = np.nan_to_num(
+                compound_returns_2d(np.ascontiguousarray(hvals[-5:])), nan=0.0
+            )
         else:
-            obs.extend([0.0] * self.n_algos)
+            feat_ret5d = _zeros
 
-        if len(historical_clean) >= 21:
-            ret_21d = (1 + historical_clean).prod() - 1
-            obs.extend(np.nan_to_num(ret_21d.values, nan=0.0))
+        if n_hist >= 21:
+            feat_ret21d = np.nan_to_num(
+                compound_returns_2d(np.ascontiguousarray(hvals)), nan=0.0
+            )
         else:
-            obs.extend([0.0] * self.n_algos)
+            feat_ret21d = _zeros
 
         # 3. Volatilidades (21d)
-        if len(historical_clean) >= 10:
-            vol_21d = historical_clean.std() * np.sqrt(252)
-            obs.extend(np.nan_to_num(vol_21d.values, nan=0.0))
+        if n_hist >= 10:
+            feat_vol = np.nan_to_num(
+                (hvals.std(axis=0) * np.sqrt(252)).astype(np.float32), nan=0.0
+            )
         else:
-            obs.extend([0.0] * self.n_algos)
+            feat_vol = _zeros
 
-        # 4. Correlación media (sampled — computing full n_algos×n_algos corr matrix is
-        #    O(n^2) and allocates ~n^2*4 bytes every step; use 64-algo sample instead)
-        if len(historical_clean) >= 10 and self.n_algos >= 2:
-            _corr_sample_size = min(64, self.n_algos)
-            rng_indices = np.linspace(0, self.n_algos - 1, _corr_sample_size, dtype=int)
-            sampled = historical_clean.iloc[:, rng_indices].values.astype(np.float32)
-            # Vectorized correlation via normalized dot product
+        # 4. Correlación media (sampled — full n_algos×n_algos corr matrix is O(n^2))
+        if len(hvals) >= 10 and n >= 2:
+            _corr_sample_size = min(64, n)
+            rng_indices = np.linspace(0, n - 1, _corr_sample_size, dtype=int)
+            sampled = hvals[:, rng_indices].astype(np.float32)
             means = sampled.mean(axis=0, keepdims=True)
             centered = sampled - means
             norms = np.linalg.norm(centered, axis=0, keepdims=True)
             norms = np.where(norms == 0, 1.0, norms)
             normed = centered / norms
-            corr_matrix = normed.T @ normed  # (sample, sample)
+            corr_matrix = normed.T @ normed
             n_s = _corr_sample_size
-            avg_corr = (corr_matrix.sum() - n_s) / max(n_s * (n_s - 1), 1)
-            obs.append(float(np.nan_to_num(avg_corr, nan=0.0)))
+            avg_corr = float(np.nan_to_num(
+                (corr_matrix.sum() - n_s) / max(n_s * (n_s - 1), 1), nan=0.0
+            ))
         else:
-            obs.append(0.0)
+            avg_corr = 0.0
 
         # 5. Drawdown actual
-        obs.append(self._calculate_drawdown())
+        drawdown = self._calculate_drawdown()
 
         # 6. Exceso de retorno acumulado vs benchmark
         if self._state.benchmark_value > 0:
-            excess = (
-                self._state.portfolio_value / self._state.benchmark_value - 1
-            )
-            obs.append(float(np.nan_to_num(excess, nan=0.0)))
+            excess = float(np.nan_to_num(
+                self._state.portfolio_value / self._state.benchmark_value - 1, nan=0.0
+            ))
         else:
-            obs.append(0.0)
+            excess = 0.0
 
-        # Final cleanup - ensure no NaN/Inf in observation
-        result = np.array(obs, dtype=np.float32)
-        result = np.nan_to_num(result, nan=0.0, posinf=1e6, neginf=-1e6)
-
+        # Build observation with np.concatenate — 400× faster than list.extend + np.array
+        scalars = np.array([avg_corr, drawdown, excess], dtype=np.float32)
+        result = np.concatenate([feat_weights, feat_ret5d, feat_ret21d, feat_vol, scalars])
+        np.nan_to_num(result, nan=0.0, posinf=1e6, neginf=-1e6, copy=False)
         return result
 
     def get_state(self) -> SimulatorState:

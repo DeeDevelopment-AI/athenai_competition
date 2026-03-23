@@ -148,7 +148,23 @@ class Phase6Runner(PhaseRunner):
         )
         parser.add_argument(
             '--models-dir', type=str, default=None,
-            help='Override directory containing trained models'
+            help=(
+                'Explicit path to directory containing trained models. '
+                'Takes priority over --run-id. '
+                'Example: --models-dir outputs/rl_training/20260323_143000/checkpoints'
+            )
+        )
+        parser.add_argument(
+            '--run-id', type=str, default=None,
+            help=(
+                'Evaluate models from a specific training run. '
+                'Default: reads outputs/rl_training/latest_run.txt (the most recent run). '
+                'Example: --run-id 20260323_143000_ppo'
+            )
+        )
+        parser.add_argument(
+            '--list-runs', action='store_true',
+            help='List all available training runs with their key parameters and exit.'
         )
         parser.add_argument(
             '--sample', type=int, default=None,
@@ -159,8 +175,122 @@ class Phase6Runner(PhaseRunner):
             help='Random seed'
         )
 
+    def _resolve_models_dir(self, args) -> Path:
+        """
+        Resolve the directory containing trained models, in priority order:
+          1. --models-dir (explicit path, highest priority)
+          2. --run-id (specific run under outputs/rl_training/)
+          3. latest_run.txt (pointer written by Phase 5 after each training run)
+          4. Error with helpful message listing available runs
+        """
+        import json as _json
+
+        rl_root = self.op.rl_training.root
+
+        # 1. Explicit override
+        if args.models_dir:
+            p = Path(args.models_dir)
+            if not p.exists():
+                raise FileNotFoundError(f"--models-dir not found: {p}")
+            self.logger.info(f"Models dir (explicit): {p}")
+            return p
+
+        # 2. Specific run-id
+        if args.run_id:
+            p = rl_root / args.run_id / "checkpoints"
+            if not p.exists():
+                raise FileNotFoundError(
+                    f"Run '{args.run_id}' not found at {p}. "
+                    f"Run with --list-runs to see available runs."
+                )
+            self.logger.info(f"Models dir (run-id '{args.run_id}'): {p}")
+            return p
+
+        # 3. latest_run.txt
+        latest_txt = rl_root / "latest_run.txt"
+        if latest_txt.exists():
+            run_id = latest_txt.read_text().strip()
+            p = rl_root / run_id / "checkpoints"
+            if p.exists():
+                # Show run_info if available for traceability
+                info_path = rl_root / run_id / "run_info.json"
+                if info_path.exists():
+                    info = _json.loads(info_path.read_text())
+                    self.logger.info(
+                        f"Evaluating latest run: '{run_id}'  "
+                        f"(agents={info.get('agents')}, "
+                        f"timesteps={info.get('total_timesteps')}, "
+                        f"encoder={info.get('use_encoder')})"
+                    )
+                else:
+                    self.logger.info(f"Evaluating latest run: '{run_id}' → {p}")
+                return p
+            self.logger.warning(
+                f"latest_run.txt points to '{run_id}' but checkpoints not found at {p}"
+            )
+
+        # 4. Fallback: legacy flat structure (before run-id was introduced)
+        legacy = rl_root / "checkpoints"
+        if legacy.exists():
+            self.logger.warning(
+                f"No latest_run.txt found. Falling back to legacy path: {legacy}. "
+                f"Re-run Phase 5 to generate a tracked run."
+            )
+            return legacy
+
+        # Nothing found — list what exists and abort
+        runs = sorted(
+            [d.name for d in rl_root.iterdir() if d.is_dir() and d.name != "checkpoints"]
+        ) if rl_root.exists() else []
+        raise FileNotFoundError(
+            f"No trained models found. "
+            + (f"Available runs: {runs}" if runs else "Run Phase 5 first.")
+            + " Use --run-id to select a specific run, or --list-runs to see all."
+        )
+
+    def _list_runs(self) -> None:
+        """Print a table of all available training runs."""
+        import json as _json
+
+        rl_root = self.op.rl_training.root
+        if not rl_root.exists():
+            print("No training runs found. Run Phase 5 first.")
+            return
+
+        latest_txt = rl_root / "latest_run.txt"
+        latest_id = latest_txt.read_text().strip() if latest_txt.exists() else None
+
+        runs = sorted(
+            [d for d in rl_root.iterdir() if d.is_dir() and (d / "run_info.json").exists()],
+            key=lambda d: d.name,
+        )
+
+        if not runs:
+            print("No runs with run_info.json found. Legacy runs may exist under checkpoints/.")
+            return
+
+        print(f"\n{'Run ID':<30} {'Agents':<15} {'Steps':>8} {'Encoder':>8} {'LR':>8}  {'Notes'}")
+        print("-" * 90)
+        for run_dir in runs:
+            try:
+                info = _json.loads((run_dir / "run_info.json").read_text())
+            except Exception:
+                continue
+            marker = " ← latest" if run_dir.name == latest_id else ""
+            agents = ",".join(info.get("agents", []))
+            steps = info.get("total_timesteps", "?")
+            enc = "yes" if info.get("use_encoder") else "no"
+            lr = info.get("training", {}).get("learning_rate", "?")
+            print(f"{run_dir.name:<30} {agents:<15} {steps:>8} {enc:>8} {lr:>8}{marker}")
+        print()
+
     def run(self, args: argparse.Namespace) -> dict:
         """Execute Phase 6 pipeline."""
+        # --list-runs: just print runs and exit (no evaluation)
+        if hasattr(args, 'list_runs') and args.list_runs:
+            self._list_runs()
+            return {}
+
         # Quick mode overrides
         if args.quick:
             args.train_window = 126  # 6 months
@@ -191,7 +321,7 @@ class Phase6Runner(PhaseRunner):
 
         # Determine paths
         output_dir = self.get_output_dir()
-        models_dir = Path(args.models_dir) if args.models_dir else self.op.rl_training.root / "checkpoints"
+        models_dir = self._resolve_models_dir(args)
 
         # ==================================================================
         # STEP 6.1: LOAD DATA
@@ -415,6 +545,33 @@ class Phase6Runner(PhaseRunner):
         if not model_path.exists() and (model_path.parent / "final_model.zip").exists():
             actual_path = model_path.parent / "final_model.zip"
 
+        # Load encoder if saved alongside the model (trained with AlgoUniverseEncoder)
+        import pickle
+        from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+        encoder = None
+        encoder_path = actual_path.parent / "universe_encoder.pkl"
+        if encoder_path.exists():
+            with open(encoder_path, "rb") as f:
+                encoder = pickle.load(f)
+            self.logger.info(
+                f"  Loaded encoder: obs_dim={encoder.obs_dim}, action_dim={encoder.action_dim}"
+            )
+        else:
+            self.logger.info("  No encoder found — using raw observation/action space")
+
+        # VecNormalize stats — MUST be reloaded for inference.
+        # The model was trained on VecNormalize-normalized observations (clip_obs=10).
+        # Evaluating without these stats feeds out-of-distribution inputs to the network.
+        vec_norm_path = actual_path.parent / "vecnormalize.pkl"
+        has_vec_norm = vec_norm_path.exists()
+        if has_vec_norm:
+            self.logger.info("  Found vecnormalize.pkl — will apply obs normalization at inference")
+        else:
+            self.logger.warning(
+                "  vecnormalize.pkl not found — obs will NOT be normalized. "
+                "Results may be poor if model was trained with VecNormalize."
+            )
+
         fold_results = []
         all_test_returns = []
 
@@ -439,13 +596,25 @@ class Phase6Runner(PhaseRunner):
                 reward_function=reward_fn,
                 episode_config=episode_config,
                 reward_scale=config.reward_scale,
+                encoder=encoder,
             )
 
-            # Load and evaluate agent
-            agent = AgentClass.from_pretrained(str(actual_path), env=test_env)
+            # Wrap in VecEnv (required for VecNormalize and SB3 agent interface)
+            test_vec_env = DummyVecEnv([lambda: test_env])
 
-            # Run episode
-            obs, _ = test_env.reset()
+            # Restore VecNormalize obs statistics from training — critical for correct inference.
+            # training=False: stats are frozen (no updates during eval).
+            # norm_reward=False: we want raw rewards for metric computation.
+            if has_vec_norm:
+                test_vec_env = VecNormalize.load(str(vec_norm_path), test_vec_env)
+                test_vec_env.training = False
+                test_vec_env.norm_reward = False
+
+            # Load and evaluate agent (spaces must match — VecNormalize keeps same Box shape)
+            agent = AgentClass.from_pretrained(str(actual_path), env=test_vec_env)
+
+            # Run episode using VecEnv interface so observations pass through VecNormalize
+            obs = test_vec_env.reset()
             done = False
             episode_returns = []
             episode_dates = []
@@ -453,15 +622,16 @@ class Phase6Runner(PhaseRunner):
 
             while not done:
                 action = agent.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = test_env.step(action)
+                obs, rewards, dones, infos = test_vec_env.step(action)
 
-                total_reward += reward
+                info = infos[0] if infos else {}
+                total_reward += float(rewards[0])
                 if 'portfolio_return' in info:
                     episode_returns.append(info['portfolio_return'])
                 if 'date' in info:
                     episode_dates.append(info['date'])
 
-                done = terminated or truncated
+                done = bool(dones[0])
 
             # Compute metrics for this fold
             if episode_returns:

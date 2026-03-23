@@ -7,6 +7,7 @@ from .trading_env import TradingEnvironment, EpisodeConfig, VecTradingEnv
 from .cost_model import CostModel
 from .constraints import PortfolioConstraints, ConstraintViolation
 from .reward import RewardFunction, RewardType, RewardComponents
+from .universe_encoder import AlgoUniverseEncoder
 
 __all__ = [
     "MarketSimulator",
@@ -21,4 +22,5 @@ __all__ = [
     "RewardFunction",
     "RewardType",
     "RewardComponents",
+    "AlgoUniverseEncoder",
 ]
