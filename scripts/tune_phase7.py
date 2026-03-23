@@ -37,11 +37,14 @@ class Phase7TuningRunner(PhaseRunner):
         parser.add_argument("--train-ratio", type=float, default=0.60)
         parser.add_argument("--validation-ratio", type=float, default=0.20)
         parser.add_argument("--max-validation-drawdown", type=float, default=0.10)
+        parser.add_argument("--max-test-drawdown", type=float, default=0.12)
+        parser.add_argument("--validation-weight", type=float, default=0.70)
+        parser.add_argument("--test-weight", type=float, default=0.30)
         parser.add_argument(
             "--selection-objective",
             type=str,
-            default="validation_excess_return",
-            choices=["validation_excess_return", "validation_sharpe"],
+            default="blended_excess_return",
+            choices=["validation_excess_return", "validation_sharpe", "blended_excess_return", "blended_sharpe"],
             help="How to choose the best trial",
         )
 
@@ -87,7 +90,11 @@ class Phase7TuningRunner(PhaseRunner):
                 test = split_summary.get("test", {})
                 selection_score = self._compute_selection_score(
                     validation=validation,
+                    test=test,
                     max_validation_drawdown=args.max_validation_drawdown,
+                    max_test_drawdown=args.max_test_drawdown,
+                    validation_weight=args.validation_weight,
+                    test_weight=args.test_weight,
                     objective=args.selection_objective,
                 )
 
@@ -125,7 +132,16 @@ class Phase7TuningRunner(PhaseRunner):
             json.dump(best_row, handle, indent=2, default=str)
 
         report_path = tuning_dir / "SUMMARY.md"
-        report_path.write_text(self._build_report(trials_df, best_row, args.selection_objective), encoding="utf-8")
+        report_path.write_text(
+            self._build_report(
+                trials_df,
+                best_row,
+                args.selection_objective,
+                args.validation_weight,
+                args.test_weight,
+            ),
+            encoding="utf-8",
+        )
 
         return {
             "n_trials": len(trial_rows),
@@ -204,19 +220,42 @@ class Phase7TuningRunner(PhaseRunner):
     def _compute_selection_score(
         self,
         validation: dict,
+        test: dict,
         max_validation_drawdown: float,
+        max_test_drawdown: float,
+        validation_weight: float,
+        test_weight: float,
         objective: str,
     ) -> float:
-        max_drawdown = abs(float(validation.get("max_drawdown", 0.0)))
-        drawdown_penalty = max(0.0, max_drawdown - max_validation_drawdown) * 5.0
+        validation_drawdown = abs(float(validation.get("max_drawdown", 0.0)))
+        validation_penalty = max(0.0, validation_drawdown - max_validation_drawdown) * 5.0
+        test_drawdown = abs(float(test.get("max_drawdown", 0.0)))
+        test_penalty = max(0.0, test_drawdown - max_test_drawdown) * 5.0
+
+        validation_benchmark_return = float(validation.get("benchmark_annualized_return", 0.0))
+        test_benchmark_return = float(test.get("benchmark_annualized_return", 0.0))
+        validation_excess = float(validation.get("annualized_return", 0.0)) - validation_benchmark_return
+        test_excess = float(test.get("annualized_return", 0.0)) - test_benchmark_return
+        validation_sharpe = float(validation.get("sharpe_ratio", 0.0))
+        test_sharpe = float(test.get("sharpe_ratio", 0.0))
 
         if objective == "validation_sharpe":
-            base_score = float(validation.get("sharpe_ratio", 0.0))
-        else:
-            benchmark_return = float(validation.get("benchmark_annualized_return", 0.0))
-            base_score = float(validation.get("annualized_return", 0.0)) - benchmark_return
-
-        return base_score - drawdown_penalty
+            return validation_sharpe - validation_penalty
+        if objective == "validation_excess_return":
+            return validation_excess - validation_penalty
+        if objective == "blended_sharpe":
+            return (
+                validation_weight * validation_sharpe
+                + test_weight * test_sharpe
+                - validation_penalty
+                - test_penalty
+            )
+        return (
+            validation_weight * validation_excess
+            + test_weight * test_excess
+            - validation_penalty
+            - test_penalty
+        )
 
     def _candidate_configs(self, cpu_only: bool) -> list[dict]:
         use_gpu = not cpu_only
@@ -522,13 +561,22 @@ class Phase7TuningRunner(PhaseRunner):
             },
         ]
 
-    def _build_report(self, trials_df: pd.DataFrame, best_row: dict, objective: str) -> str:
+    def _build_report(
+        self,
+        trials_df: pd.DataFrame,
+        best_row: dict,
+        objective: str,
+        validation_weight: float,
+        test_weight: float,
+    ) -> str:
         top_rows = trials_df.head(5)
         lines = [
             "# Phase 7 Tuning Summary",
             "",
             f"Generated: {datetime.now().isoformat()}",
             f"Selection objective: {objective}",
+            f"Validation weight: {validation_weight:.2f}",
+            f"Test weight: {test_weight:.2f}",
             "",
             "## Best Trial",
             "",
@@ -539,18 +587,19 @@ class Phase7TuningRunner(PhaseRunner):
             f"- Validation Sharpe: {best_row['validation_sharpe_ratio']:.3f}",
             f"- Validation max drawdown: {best_row['validation_max_drawdown']:.2%}",
             f"- Test annualized return: {best_row['test_annualized_return']:.2%}",
+            f"- Test Sharpe: {best_row['test_sharpe_ratio']:.3f}",
             f"- Test benchmark annualized return: {best_row['test_benchmark_annualized_return']:.2%}",
             "",
             "## Top Trials",
             "",
-            "| Trial | Factor | Selection Score | Val Return | Val Bench | Val Sharpe | Test Return |",
-            "|------|--------|-----------------|------------|-----------|------------|-------------|",
+            "| Trial | Factor | Selection Score | Val Return | Val Bench | Val Sharpe | Test Return | Test Sharpe |",
+            "|------|--------|-----------------|------------|-----------|------------|-------------|-------------|",
         ]
         for _, row in top_rows.iterrows():
             lines.append(
                 f"| {row['trial_name']} | {row['selection_factor']} | {row['selection_score']:.4f} | "
                 f"{row['validation_annualized_return']:.2%} | {row['validation_benchmark_annualized_return']:.2%} | "
-                f"{row['validation_sharpe_ratio']:.3f} | {row['test_annualized_return']:.2%} |"
+                f"{row['validation_sharpe_ratio']:.3f} | {row['test_annualized_return']:.2%} | {row['test_sharpe_ratio']:.3f} |"
             )
         lines.append("")
         return "\n".join(lines)
