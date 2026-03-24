@@ -330,6 +330,10 @@ class Phase5Runner(PhaseRunner):
                 'Pass the same run-id to run_phase6.py --run-id to evaluate this specific run.'
             )
         )
+        parser.add_argument(
+            '--gpu-env', action='store_true',
+            help='Use GPU-accelerated batched environment (requires CUDA)'
+        )
 
     def run(self, args: argparse.Namespace) -> dict:
         """Execute Phase 5 pipeline."""
@@ -532,103 +536,175 @@ class Phase5Runner(PhaseRunner):
         # STEP 5.3: CREATE ENVIRONMENTS
         # ==================================================================
         with self.step("5.3 Create Training Environments"):
-            from src.environment.trading_env import EpisodeConfig, VecTradingEnv
+            from src.environment.trading_env import TradingEnvironment, EpisodeConfig, VecTradingEnv
             from src.environment.cost_model import CostModel
             from src.environment.constraints import PortfolioConstraints
             from src.environment.reward import RewardFunction, RewardType
 
-            # Components
-            cost_model = CostModel(
-                spread_bps=config.spread_bps,
-                slippage_bps=config.slippage_bps,
-                impact_coefficient=config.impact_coefficient,
-            )
-            constraints = PortfolioConstraints(
-                max_weight=config.max_weight,
-                min_weight=config.min_weight,
-                max_turnover=config.max_turnover,
-                max_exposure=config.max_exposure,
-            )
-            reward_fn = RewardFunction(
-                reward_type=RewardType.ALPHA_PENALIZED,
-                cost_penalty_weight=config.cost_penalty,
-                turnover_penalty_weight=config.turnover_penalty,
-                drawdown_penalty_weight=config.drawdown_penalty,
-            )
+            # --- Get encoder (fitted in step 5.2.5) ---
+            # NOTE: encoder is already available from step 5.2.5
+            # If not, retrieve it from where step 5.2.5 stores it
 
-            episode_config = EpisodeConfig(
-                random_start=config.random_start,
-                episode_length=config.episode_length,
-                min_episode_length=26,
-                warmup_periods=4,
-            )
+            use_gpu_env = getattr(args, 'gpu_env', False) and torch.cuda.is_available()
 
-            # Training environment (vectorized)
-            train_env = VecTradingEnv(
-                n_envs=n_envs,
-                use_subproc=use_subproc,
-                algo_returns=algo_returns,
-                benchmark_weights=benchmark_weights,
-                train_start=train_dates[0],
-                train_end=train_dates[1],
-                initial_capital=config.initial_capital,
-                rebalance_frequency=config.rebalance_frequency,
-                cost_model=cost_model,
-                constraints=constraints,
-                reward_function=reward_fn,
-                episode_config=episode_config,
-                reward_scale=config.reward_scale,
-                encoder=encoder,
-            )
+            if use_gpu_env:
+                # ============================================================
+                # GPU-ACCELERATED PATH
+                # ============================================================
+                from src.environment.gpu_vec_env import GPUVecTradingEnv, GPUEnvConfig
 
-            # Evaluation environment (validation period, always DummyVecEnv)
-            eval_episode_config = EpisodeConfig(
-                random_start=False,
-                episode_length=config.episode_length,
-                min_episode_length=26,
-            )
-            eval_env = VecTradingEnv(
-                n_envs=1,
-                use_subproc=False,
-                algo_returns=algo_returns,
-                benchmark_weights=benchmark_weights,
-                train_start=val_dates[0],
-                train_end=val_dates[1],
-                initial_capital=config.initial_capital,
-                rebalance_frequency=config.rebalance_frequency,
-                cost_model=cost_model,
-                constraints=constraints,
-                reward_function=reward_fn,
-                episode_config=eval_episode_config,
-                reward_scale=config.reward_scale,
-                encoder=encoder,
-            )
+                gpu_config = GPUEnvConfig(
+                    initial_capital=config.initial_capital,
+                    rebalance_frequency=config.rebalance_frequency,
+                    episode_length=config.episode_length,
+                    random_start=config.random_start,
+                    max_weight=config.max_weight,
+                    min_weight=config.min_weight,
+                    max_turnover=config.max_turnover,
+                    max_exposure=config.max_exposure,
+                    spread_bps=config.spread_bps,
+                    slippage_bps=config.slippage_bps,
+                    impact_coefficient=config.impact_coefficient,
+                    reward_scale=config.reward_scale,
+                    cost_penalty=config.cost_penalty,
+                    turnover_penalty=config.turnover_penalty,
+                    drawdown_penalty=config.drawdown_penalty,
+                    seed=config.seed,
+                )
 
-            from stable_baselines3.common.vec_env import VecNormalize
+                # Training environment (GPU batched)
+                train_vec_env = GPUVecTradingEnv(
+                    n_envs=n_envs,
+                    algo_returns=algo_returns,
+                    benchmark_weights=benchmark_weights,
+                    family_encoder=encoder,  # from step 5.2.5
+                    train_start=train_dates[0],
+                    train_end=train_dates[1],
+                    config=gpu_config,
+                    device="cuda",
+                )
 
-            # Extract the underlying VecEnv from the wrapper
-            train_vec_env = train_env.envs
-            eval_vec_env = eval_env.envs
+                # Eval environment (can also use GPU, smaller)
+                eval_gpu_config = GPUEnvConfig(
+                    initial_capital=config.initial_capital,
+                    rebalance_frequency=config.rebalance_frequency,
+                    episode_length=config.episode_length,
+                    random_start=False,  # Deterministic eval
+                    max_weight=config.max_weight,
+                    min_weight=config.min_weight,
+                    max_turnover=config.max_turnover,
+                    max_exposure=config.max_exposure,
+                    spread_bps=config.spread_bps,
+                    slippage_bps=config.slippage_bps,
+                    impact_coefficient=config.impact_coefficient,
+                    reward_scale=config.reward_scale,
+                    cost_penalty=config.cost_penalty,
+                    turnover_penalty=config.turnover_penalty,
+                    drawdown_penalty=config.drawdown_penalty,
+                    seed=config.seed,
+                )
 
-            # VecNormalize: normalize each obs feature to ~N(0,1) via running stats.
-            # Critical with obs_dim=54055 — raw obs L2 norm is ~2300, which causes
-            # NaN gradient explosion in the first backward pass without normalization.
-            train_vec_env = VecNormalize(
-                train_vec_env,
-                norm_obs=True,
-                norm_reward=True,
-                clip_obs=10.0,
-                gamma=0.99,
-            )
-            # Eval env shares obs stats from train (no stat updates during eval)
-            eval_vec_env = VecNormalize(
-                eval_vec_env,
-                norm_obs=True,
-                norm_reward=False,
-                clip_obs=10.0,
-                training=False,
-            )
-            eval_vec_env.obs_rms = train_vec_env.obs_rms
+                eval_vec_env = GPUVecTradingEnv(
+                    n_envs=1,
+                    algo_returns=algo_returns,
+                    benchmark_weights=benchmark_weights,
+                    family_encoder=encoder,
+                    train_start=val_dates[0],
+                    train_end=val_dates[1],
+                    config=eval_gpu_config,
+                    device="cuda",
+                )
+
+                # Wrap with VecNormalize as before
+                from stable_baselines3.common.vec_env import VecNormalize
+
+                train_vec_env = VecNormalize(
+                    train_vec_env,
+                    norm_obs=True,
+                    norm_reward=True,
+                    clip_obs=10.0,
+                    gamma=0.99,
+                )
+                eval_vec_env = VecNormalize(
+                    eval_vec_env,
+                    norm_obs=True,
+                    norm_reward=False,
+                    clip_obs=10.0,
+                    training=False,
+                )
+                eval_vec_env.obs_rms = train_vec_env.obs_rms
+
+                self.logger.info(f"GPU Training env: {n_envs} batched envs on CUDA")
+
+            else:
+                # ============================================================
+                # ORIGINAL CPU PATH (unchanged)
+                # ============================================================
+                cost_model = CostModel(
+                    spread_bps=config.spread_bps,
+                    slippage_bps=config.slippage_bps,
+                    impact_coefficient=config.impact_coefficient,
+                )
+                constraints = PortfolioConstraints(
+                    max_weight=config.max_weight,
+                    min_weight=config.min_weight,
+                    max_turnover=config.max_turnover,
+                    max_exposure=config.max_exposure,
+                )
+                reward_fn = RewardFunction(
+                    reward_type=RewardType.ALPHA_PENALIZED,
+                    cost_penalty_weight=config.cost_penalty,
+                    turnover_penalty_weight=config.turnover_penalty,
+                    drawdown_penalty_weight=config.drawdown_penalty,
+                )
+                episode_config = EpisodeConfig(
+                    random_start=config.random_start,
+                    episode_length=config.episode_length,
+                    min_episode_length=26,
+                    warmup_periods=4,
+                )
+
+                train_env = VecTradingEnv(
+                    n_envs=n_envs,
+                    use_subproc=use_subproc,
+                    algo_returns=algo_returns,
+                    benchmark_weights=benchmark_weights,
+                    train_start=train_dates[0],
+                    train_end=train_dates[1],
+                    initial_capital=config.initial_capital,
+                    rebalance_frequency=config.rebalance_frequency,
+                    cost_model=cost_model,
+                    constraints=constraints,
+                    reward_function=reward_fn,
+                    episode_config=episode_config,
+                    reward_scale=config.reward_scale,
+                )
+                eval_episode_config = EpisodeConfig(
+                    random_start=False,
+                    episode_length=config.episode_length,
+                    min_episode_length=26,
+                )
+                eval_env = VecTradingEnv(
+                    n_envs=1,
+                    use_subproc=False,
+                    algo_returns=algo_returns,
+                    benchmark_weights=benchmark_weights,
+                    train_start=val_dates[0],
+                    train_end=val_dates[1],
+                    initial_capital=config.initial_capital,
+                    rebalance_frequency=config.rebalance_frequency,
+                    cost_model=cost_model,
+                    constraints=constraints,
+                    reward_function=reward_fn,
+                    episode_config=eval_episode_config,
+                    reward_scale=config.reward_scale,
+                )
+
+                from stable_baselines3.common.vec_env import VecNormalize
+                train_vec_env = VecNormalize(train_env.envs, norm_obs=True, norm_reward=True, clip_obs=10.0, gamma=0.99)
+                eval_vec_env = VecNormalize(eval_env.envs, norm_obs=True, norm_reward=False, clip_obs=10.0,
+                                            training=False)
+                eval_vec_env.obs_rms = train_vec_env.obs_rms
 
             self.logger.info(f"Training env: {train_vec_env.num_envs} parallel envs (VecNormalize)")
             self.logger.info(f"Observation shape: {train_vec_env.observation_space.shape}")
@@ -638,6 +714,7 @@ class Phase5Runner(PhaseRunner):
                 'observation_shape': list(train_vec_env.observation_space.shape),
                 'action_shape': list(train_vec_env.action_space.shape),
                 'n_parallel_envs': train_vec_env.num_envs,
+                'gpu_accelerated': use_gpu_env,
             }
 
         # ==================================================================
