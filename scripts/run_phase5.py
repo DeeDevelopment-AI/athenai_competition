@@ -903,10 +903,16 @@ class Phase5Runner(PhaseRunner):
         from stable_baselines3.common.vec_env import VecNormalize as _VN  # local alias
         _inner = train_env.venv if isinstance(train_env, _VN) else train_env
         _env0 = _inner.envs[0] if hasattr(_inner, 'envs') else None
+        # Try to get encoder from CPU env or GPU env
+        _encoder = None
         if _env0 is not None and hasattr(_env0, 'encoder') and _env0.encoder is not None:
+            _encoder = _env0.encoder
+        elif hasattr(_inner, 'encoder') and _inner.encoder is not None:
+            _encoder = _inner.encoder
+        if _encoder is not None:
             enc_path = agent_dir / "universe_encoder.pkl"
             with open(enc_path, "wb") as f:
-                pickle.dump(_env0.encoder, f)
+                pickle.dump(_encoder, f)
             self.logger.info(f"Saved universe encoder to: {enc_path}")
 
         # Get training metrics
