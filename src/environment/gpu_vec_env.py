@@ -730,13 +730,16 @@ class GPUVecTradingEnv(VecEnv):
         return [False] * self._n_envs
 
     def env_method(self, method_name, *method_args, indices=None, **method_kwargs):
-        raise NotImplementedError
+        return [None] * self._n_envs
 
     def get_attr(self, attr_name, indices=None):
-        raise NotImplementedError
+        # SB3 asks for render_mode during __init__
+        if attr_name == "render_mode":
+            return [None] * self._n_envs
+        return [None] * self._n_envs
 
     def set_attr(self, attr_name, value, indices=None):
-        raise NotImplementedError
+        pass
 
     def seed(self, seed=None):
         if seed is not None:
