@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Optional, List
 
 import numpy as np
+import torch
 import pandas as pd
 
 # Suppress warnings
