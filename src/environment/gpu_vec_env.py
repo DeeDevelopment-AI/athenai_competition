@@ -119,7 +119,7 @@ class GPUVecTradingEnv(VecEnv):
 
         # Training date range (for episode sampling)
         train_mask = (algo_returns.index >= train_start) & (algo_returns.index <= train_end)
-        train_indices = np.where(train_mask.values)[0]
+        train_indices = np.where(train_mask)[0]
         self._train_start_idx = int(train_indices[0])
         self._train_end_idx = int(train_indices[-1])
 
