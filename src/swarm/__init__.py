@@ -1,5 +1,6 @@
 """Swarm-based meta-allocation modules."""
 
+from .aco_allocator import ACOAllocatorBacktester, ACOConfig
 from .meta_allocator import (
     SwarmAllocatorBacktester,
     SwarmBacktestResult,
@@ -8,6 +9,8 @@ from .meta_allocator import (
 )
 
 __all__ = [
+    "ACOAllocatorBacktester",
+    "ACOConfig",
     "SwarmAllocatorBacktester",
     "SwarmBacktestResult",
     "SwarmConfig",

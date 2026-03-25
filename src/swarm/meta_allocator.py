@@ -833,7 +833,7 @@ class SwarmAllocatorBacktester:
         cluster_stability: Optional[pd.DataFrame] = None,
         cluster_alpha_scores: Optional[dict[str, dict[str, float]]] = None,
         regime_labels: Optional[pd.Series] = None,
-        selection_factor: str = "rolling_sharpe_21d",
+        selection_factor: str | list[str] | tuple[str, ...] = "rolling_sharpe_21d",
     ):
         self.algo_returns = algo_returns.sort_index()
         self.features = features
@@ -846,7 +846,10 @@ class SwarmAllocatorBacktester:
         self.cluster_stability = cluster_stability
         self.cluster_alpha_scores = cluster_alpha_scores or {}
         self.regime_labels = regime_labels
-        self.selection_factor = selection_factor
+        self.selection_factors = self._normalize_selection_factors(selection_factor)
+        self.selection_factor = (
+            self.selection_factors[0] if len(self.selection_factors) == 1 else list(self.selection_factors)
+        )
         self._last_selection_diagnostics: dict[str, float] = {}
         self.allocator = SwarmMetaAllocator(
             config=config,
@@ -1284,11 +1287,8 @@ class SwarmAllocatorBacktester:
         feature_row = self._latest_feature_row(date)
         if feature_row is not None:
             stats["feature_score"] = [self._score_feature_row(feature_row, algo) for algo in candidates]
-            selected_signal = []
-            for algo in candidates:
-                value = feature_row.get(f"{algo}_{self.selection_factor}", np.nan)
-                selected_signal.append(float(value) if not pd.isna(value) else np.nan)
-            stats["selected_signal"] = selected_signal
+            selected_signal = self._compute_selected_signal(feature_row, candidates)
+            stats["selected_signal"] = selected_signal.reindex(candidates)
         else:
             stats["feature_score"] = 0.0
             stats["selected_signal"] = np.nan
@@ -1390,6 +1390,42 @@ class SwarmAllocatorBacktester:
             score += weight * float(value)
             found = True
         return score if found else np.nan
+
+    def _normalize_selection_factors(
+        self,
+        selection_factor: str | list[str] | tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if isinstance(selection_factor, str):
+            factors = [selection_factor]
+        else:
+            factors = [str(factor) for factor in selection_factor if str(factor)]
+        normalized = tuple(dict.fromkeys(factors))
+        return normalized or ("rolling_sharpe_21d",)
+
+    def _selection_factor_direction(self, suffix: str) -> float:
+        suffix_lower = suffix.lower()
+        if "drawdown" in suffix_lower or "volatility" in suffix_lower:
+            return -1.0
+        return 1.0
+
+    def _compute_selected_signal(
+        self,
+        feature_row: pd.Series,
+        candidates: list[str],
+    ) -> pd.Series:
+        components = []
+        for suffix in self.selection_factors:
+            raw = pd.to_numeric(
+                pd.Series([feature_row.get(f"{algo}_{suffix}", np.nan) for algo in candidates], index=candidates),
+                errors="coerce",
+            )
+            if raw.notna().sum() == 0:
+                continue
+            oriented = raw * self._selection_factor_direction(suffix)
+            components.append(self._cross_sectional_zscore(oriented))
+        if not components:
+            return pd.Series(np.nan, index=candidates, dtype=np.float64)
+        return pd.concat(components, axis=1).mean(axis=1, skipna=True).replace([np.inf, -np.inf], np.nan)
 
     def _cross_sectional_zscore(self, series: pd.Series) -> pd.Series:
         series = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)

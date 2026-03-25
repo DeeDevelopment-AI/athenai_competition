@@ -77,4 +77,5 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v --cov=src --cov-report=term-missing"
+addopts = "-v --cov=src --cov-report=term-missing --basetemp=.pytest_tmp/tmp"
+cache_dir = ".pytest_tmp/cache"

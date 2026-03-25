@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -142,23 +143,11 @@ class Phase7Runner(PhaseRunner):
         output_dir = self.get_output_dir()
 
         with self.step("7.1 Load Phase 1 Artifacts"):
-            algo_returns = self._load_returns(input_dir)
-            features = self._load_optional_features(input_dir)
+            sampled_cols = self._resolve_sampled_algorithms(input_dir, args.sample)
+            algo_returns = self._load_returns(input_dir, sampled_cols=sampled_cols)
+            features = self._load_optional_features(input_dir, sampled_algorithms=sampled_cols)
             benchmark_returns = self._load_optional_benchmark_returns(input_dir)
-            benchmark_weights = self._load_optional_benchmark_weights(input_dir)
-
-            if args.sample and args.sample < len(algo_returns.columns):
-                sampled_cols = algo_returns.columns[: args.sample]
-                algo_returns = algo_returns[sampled_cols]
-                if features is not None:
-                    feature_cols = [
-                        c for c in features.columns
-                        if any(c.startswith(f"{algo}_") for algo in sampled_cols)
-                        or c.startswith("rolling_market")
-                    ]
-                    features = features[feature_cols]
-                if benchmark_weights is not None:
-                    benchmark_weights = benchmark_weights.reindex(columns=sampled_cols, fill_value=0.0)
+            benchmark_weights = self._load_optional_benchmark_weights(input_dir, sampled_cols=sampled_cols)
 
             results["artifacts"]["returns_shape"] = list(algo_returns.shape)
             results["artifacts"]["features_available"] = features is not None
@@ -313,24 +302,96 @@ class Phase7Runner(PhaseRunner):
 
         return results
 
-    def _load_returns(self, input_dir: Path) -> pd.DataFrame:
+    def _resolve_sampled_algorithms(self, input_dir: Path, sample: int | None) -> list[str] | None:
+        if sample is None:
+            return None
         path = self.dp.algorithms.returns
         if not path.exists():
             path = input_dir / "algo_returns.parquet"
         if not path.exists():
             raise FileNotFoundError(f"Returns matrix not found: {path}")
-        returns = pd.read_parquet(path).astype(np.float32, copy=False)
+        columns = self._peek_parquet_columns(path)
+        if sample >= len(columns):
+            return None
+        return columns[:sample]
+
+    def _peek_parquet_columns(self, path: Path) -> list[str]:
+        return list(pq.ParquetFile(path).schema.names)
+
+    def _load_returns(self, input_dir: Path, sampled_cols: list[str] | None = None) -> pd.DataFrame:
+        path = self.dp.algorithms.returns
+        if not path.exists():
+            path = input_dir / "algo_returns.parquet"
+        if not path.exists():
+            raise FileNotFoundError(f"Returns matrix not found: {path}")
+        read_columns = sampled_cols if sampled_cols else None
+        returns = pd.read_parquet(path, columns=read_columns).astype(np.float32, copy=False)
         if getattr(returns.index, "tz", None) is not None:
             returns.index = returns.index.tz_localize(None)
         return returns
 
-    def _load_optional_features(self, input_dir: Path) -> pd.DataFrame | None:
+    def _feature_columns_for_algorithms(
+        self,
+        path: Path,
+        sampled_algorithms: list[str] | None,
+        extra_suffixes: set[str] | None = None,
+    ) -> list[str] | None:
+        columns = self._peek_parquet_columns(path)
+        required_suffixes = self._required_feature_suffixes(extra_suffixes=extra_suffixes)
+        prefixes = tuple(f"{algo}_" for algo in sampled_algorithms) if sampled_algorithms else None
+        selected = []
+        for column in columns:
+            if column.startswith("rolling_market"):
+                selected.append(column)
+                continue
+            if prefixes is not None and not column.startswith(prefixes):
+                continue
+            if any(column.endswith(f"_{suffix}") for suffix in required_suffixes):
+                selected.append(column)
+        return selected or None
+
+    def _required_feature_suffixes(self, extra_suffixes: set[str] | None = None) -> set[str]:
+        suffixes = {
+            "rolling_sharpe_5d",
+            "rolling_sharpe_21d",
+            "rolling_sharpe_63d",
+            "rolling_return_21d",
+            "rolling_return_63d",
+            "rolling_volatility_21d",
+            "rolling_volatility_63d",
+            "rolling_profit_factor_21d",
+            "rolling_profit_factor_63d",
+            "rolling_calmar_21d",
+            "rolling_calmar_63d",
+            "rolling_drawdown_21d",
+            "rolling_drawdown_63d",
+            "volatility",
+            "max_drawdown",
+            "drawdown",
+        }
+        selection_factor = getattr(self.args, "selection_factor", None)
+        if selection_factor:
+            if isinstance(selection_factor, str):
+                suffixes.add(selection_factor)
+            else:
+                suffixes.update(str(factor) for factor in selection_factor if str(factor))
+        if extra_suffixes:
+            suffixes.update(extra_suffixes)
+        return suffixes
+
+    def _load_optional_features(
+        self,
+        input_dir: Path,
+        sampled_algorithms: list[str] | None = None,
+        extra_suffixes: set[str] | None = None,
+    ) -> pd.DataFrame | None:
         path = self.dp.algorithms.features
         if not path.exists():
             path = input_dir / "algo_features.parquet"
         if not path.exists():
             return None
-        features = pd.read_parquet(path)
+        read_columns = self._feature_columns_for_algorithms(path, sampled_algorithms, extra_suffixes=extra_suffixes)
+        features = pd.read_parquet(path, columns=read_columns)
         if getattr(features.index, "tz", None) is not None:
             features.index = features.index.tz_localize(None)
         return features
@@ -347,13 +408,18 @@ class Phase7Runner(PhaseRunner):
             series.index = series.index.tz_localize(None)
         return series.astype(np.float32)
 
-    def _load_optional_benchmark_weights(self, input_dir: Path) -> pd.DataFrame | None:
+    def _load_optional_benchmark_weights(
+        self,
+        input_dir: Path,
+        sampled_cols: list[str] | None = None,
+    ) -> pd.DataFrame | None:
         path = self.dp.benchmark.weights
         if not path.exists():
             path = input_dir / "benchmark_weights.parquet"
         if not path.exists():
             return None
-        weights = pd.read_parquet(path).astype(np.float32, copy=False)
+        read_columns = sampled_cols if sampled_cols else None
+        weights = pd.read_parquet(path, columns=read_columns).astype(np.float32, copy=False)
         if getattr(weights.index, "tz", None) is not None:
             weights.index = weights.index.tz_localize(None)
         return weights
