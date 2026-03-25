@@ -347,17 +347,41 @@ class EvaluationOutputPaths:
 
 
 @dataclass(frozen=True)
+class SwarmOutputPaths:
+    """Paths for Phase 7 swarm meta-allocator outputs."""
+    root: Path = PROJECT_ROOT / "outputs" / "swarm_allocator"
+
+    @property
+    def weights_dir(self) -> Path:
+        return self.root / "weights"
+
+    @property
+    def backtests_dir(self) -> Path:
+        return self.root / "backtests"
+
+    @property
+    def diagnostics_dir(self) -> Path:
+        return self.root / "diagnostics"
+
+    @property
+    def reports_dir(self) -> Path:
+        return self.root / "reports"
+
+
+@dataclass(frozen=True)
 class OutputPaths:
     """All output paths."""
     root: Path = PROJECT_ROOT / "outputs"
     baselines: BaselineOutputPaths = None
     rl_training: RLTrainingOutputPaths = None
     evaluation: EvaluationOutputPaths = None
+    swarm: SwarmOutputPaths = None
 
     def __post_init__(self):
         object.__setattr__(self, 'baselines', BaselineOutputPaths())
         object.__setattr__(self, 'rl_training', RLTrainingOutputPaths())
         object.__setattr__(self, 'evaluation', EvaluationOutputPaths())
+        object.__setattr__(self, 'swarm', SwarmOutputPaths())
 
     @property
     def reports_dir(self) -> Path:

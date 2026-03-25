@@ -11,6 +11,7 @@ Each phase has a single consolidated script with built-in performance monitoring
 | `run_phase1.py` | Data Loading & Feature Engineering | `data/processed/` |
 | `run_phase2.py` | Analysis & Reverse Engineering | `data/processed/analysis/` |
 | `run_phase3.py` | Baseline Backtesting | `outputs/baselines/` |
+| `run_phase7.py` | Swarm Meta-Allocator | `outputs/swarm_allocator/` |
 
 ### Usage
 
@@ -30,6 +31,8 @@ python scripts/run_phase3.py
 python scripts/run_phase3.py --quick                        # Few configs
 python scripts/run_phase3.py --full                         # All + walk-forward
 python scripts/run_phase3.py --baseline risk_parity         # Single baseline
+python scripts/run_phase7.py                                # Swarm meta-allocator
+python scripts/run_phase7.py --top-k 32 --particles 64      # Faster swarm test
 ```
 
 ### Common Options

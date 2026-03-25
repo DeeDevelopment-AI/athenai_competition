@@ -26,6 +26,7 @@ import gc
 import logging
 import os
 import platform
+import shutil
 import sys
 import time
 import traceback
@@ -74,6 +75,17 @@ def is_gpu_available() -> bool:
 def get_gpu_backend() -> Optional[str]:
     """Get the GPU backend name (cuda, mps, or None)."""
     return _GPU_BACKEND
+
+
+def detect_system_gpu() -> tuple[bool, Optional[str]]:
+    """
+    Detect whether the host system exposes NVIDIA tooling even if torch cannot use it.
+    """
+    if shutil.which("nvidia-smi"):
+        return True, "nvidia-smi"
+    if shutil.which("nvcc"):
+        return True, "nvcc"
+    return False, None
 
 
 # =============================================================================

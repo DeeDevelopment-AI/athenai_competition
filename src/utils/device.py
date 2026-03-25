@@ -22,6 +22,7 @@ Usage:
 
 import logging
 import os
+import shutil
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -49,6 +50,9 @@ class DeviceInfo:
     recommended_device: str
     torch_version: str
     cuda_version: str
+    system_cuda_detected: bool = False
+    system_cuda_source: str = ""
+    diagnostic_message: str = ""
 
     def __str__(self) -> str:
         lines = [
@@ -64,7 +68,11 @@ class DeviceInfo:
                 f"  Memory total: {self.cuda_memory_total_gb:.2f} GB",
                 f"  Memory free: {self.cuda_memory_free_gb:.2f} GB",
             ])
+        elif self.system_cuda_detected:
+            lines.append(f"  System CUDA detected via: {self.system_cuda_source}")
         lines.append(f"  Recommended device: {self.recommended_device}")
+        if self.diagnostic_message:
+            lines.append(f"  Note: {self.diagnostic_message}")
         return "\n".join(lines)
 
 
@@ -115,6 +123,19 @@ class DeviceManager:
 
         return "cpu"
 
+    @staticmethod
+    def detect_system_cuda() -> tuple[bool, str]:
+        """
+        Detect whether the host system exposes NVIDIA/CUDA tools.
+
+        This does not guarantee the current torch build can use CUDA.
+        """
+        if shutil.which("nvidia-smi"):
+            return True, "nvidia-smi"
+        if shutil.which("nvcc"):
+            return True, "nvcc"
+        return False, ""
+
     @property
     def device(self) -> str:
         """Get the selected device string ('cuda' or 'cpu')."""
@@ -149,6 +170,8 @@ class DeviceManager:
         cuda_memory_total_gb = 0.0
         cuda_memory_free_gb = 0.0
         cuda_version = ""
+        system_cuda_detected, system_cuda_source = cls.detect_system_cuda()
+        diagnostic_message = ""
 
         if cuda_available and cuda_device_count > 0:
             cuda_device_name = torch.cuda.get_device_name(0)
@@ -165,6 +188,12 @@ class DeviceManager:
 
         manager = cls()
 
+        if system_cuda_detected and not cuda_available:
+            diagnostic_message = (
+                "NVIDIA/CUDA is present on the system, but the current PyTorch build "
+                "cannot use CUDA. This usually means torch was installed as CPU-only."
+            )
+
         return DeviceInfo(
             has_cuda=True,
             cuda_available=cuda_available,
@@ -175,6 +204,9 @@ class DeviceManager:
             recommended_device=manager.device,
             torch_version=torch.__version__,
             cuda_version=cuda_version,
+            system_cuda_detected=system_cuda_detected,
+            system_cuda_source=system_cuda_source,
+            diagnostic_message=diagnostic_message,
         )
 
     @classmethod

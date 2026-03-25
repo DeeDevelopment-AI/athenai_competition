@@ -35,7 +35,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils.paths import data_paths, output_paths, ensure_dir, ensure_parent_dir, PROJECT_ROOT
-from src.utils.performance_monitor import PhaseMonitor, get_memory_info, is_gpu_available, get_gpu_backend
+from src.utils.performance_monitor import (
+    PhaseMonitor,
+    detect_system_gpu,
+    get_gpu_backend,
+    get_memory_info,
+    is_gpu_available,
+)
+from src.utils.device import DeviceManager
 
 
 class PhaseRunner(ABC):
@@ -175,6 +182,8 @@ class PhaseRunner(ABC):
             return self.op.rl_training.root
         elif self.phase_number == 6:
             return self.op.evaluation.root
+        elif self.phase_number == 7:
+            return self.op.swarm.root
         else:
             return self.op.root / f"phase{self.phase_number}"
 
@@ -257,7 +266,14 @@ class PhaseRunner(ABC):
         if is_gpu_available():
             self.logger.info(f"GPU:     {get_gpu_backend()} available")
         else:
-            self.logger.info("GPU:     Not available")
+            system_gpu, source = detect_system_gpu()
+            if system_gpu:
+                device_info = DeviceManager.get_device_info()
+                detail = device_info.diagnostic_message or "System GPU detected but runtime CUDA is unavailable"
+                self.logger.info(f"GPU:     System GPU detected via {source}, but torch runtime is CPU-only")
+                self.logger.info(f"GPU:     {detail}")
+            else:
+                self.logger.info("GPU:     Not available")
 
         self.logger.info("=" * 70)
 
