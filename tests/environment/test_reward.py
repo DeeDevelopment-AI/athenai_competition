@@ -268,6 +268,63 @@ class TestRiskPenalty:
         assert result.risk_penalty == 0.0
 
 
+class TestPureReturnsReward:
+    """Tests para reward tipo PURE_RETURNS."""
+
+    def test_pure_returns_ignores_benchmark(self):
+        """Pure returns solo usa portfolio return, ignora benchmark."""
+        reward_fn = RewardFunction(reward_type=RewardType.PURE_RETURNS)
+
+        result = reward_fn.compute(
+            portfolio_return=0.02,
+            benchmark_return=0.05,  # Benchmark higher, but ignored
+        )
+
+        assert result.base_reward == pytest.approx(0.02)
+        assert result.total == pytest.approx(0.02)
+
+    def test_pure_returns_ignores_penalties(self):
+        """Pure returns ignora todas las penalizaciones."""
+        reward_fn = RewardFunction(
+            reward_type=RewardType.PURE_RETURNS,
+            cost_penalty_weight=1.0,
+            turnover_penalty_weight=1.0,
+            drawdown_penalty_weight=1.0,
+            risk_penalty_weight=1.0,
+        )
+
+        result = reward_fn.compute(
+            portfolio_return=0.03,
+            benchmark_return=0.01,
+            transaction_costs=0.01,
+            turnover=0.50,
+            current_drawdown=-0.20,
+            portfolio_vol=0.30,
+            benchmark_vol=0.10,
+        )
+
+        # All penalties should be 0
+        assert result.cost_penalty == 0.0
+        assert result.turnover_penalty == 0.0
+        assert result.drawdown_penalty == 0.0
+        assert result.risk_penalty == 0.0
+        assert result.tracking_error_penalty == 0.0
+        # Total should equal base_reward (portfolio return)
+        assert result.total == pytest.approx(0.03)
+
+    def test_pure_returns_negative(self):
+        """Pure returns con retorno negativo."""
+        reward_fn = RewardFunction(reward_type=RewardType.PURE_RETURNS)
+
+        result = reward_fn.compute(
+            portfolio_return=-0.02,
+            benchmark_return=0.01,
+        )
+
+        assert result.base_reward == pytest.approx(-0.02)
+        assert result.total == pytest.approx(-0.02)
+
+
 class TestInformationRatioReward:
     """Tests para reward tipo INFORMATION_RATIO."""
 

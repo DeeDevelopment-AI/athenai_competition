@@ -29,7 +29,7 @@ costs:
   impact_coefficient: 0.1
 
 reward:
-  type: "alpha_penalized"      # "alpha_penalized", "info_ratio", "risk_adjusted"
+  type: "pure_returns"      # "alpha_penalized", "info_ratio", "risk_adjusted", "pure_returns"
   cost_penalty: 1.0
   turnover_penalty: 0.1
   drawdown_penalty: 0.5

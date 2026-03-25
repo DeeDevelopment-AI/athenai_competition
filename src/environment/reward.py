@@ -16,6 +16,7 @@ class RewardType(Enum):
     INFORMATION_RATIO = "info_ratio"
     RISK_ADJUSTED = "risk_adjusted"
     DIVERSIFIED = "diversified"
+    PURE_RETURNS = "pure_returns"  # Maximize returns only, no penalties
 
 
 @dataclass
@@ -124,7 +125,20 @@ class RewardFunction:
             benchmark_vol = safe_float(benchmark_vol)
 
         # Base reward según tipo
-        if self.reward_type == RewardType.ALPHA_PENALIZED:
+        if self.reward_type == RewardType.PURE_RETURNS:
+            # Pure returns: only maximize portfolio return, no penalties
+            base_reward = portfolio_return
+            return RewardComponents(
+                base_reward=safe_float(base_reward),
+                cost_penalty=0.0,
+                turnover_penalty=0.0,
+                drawdown_penalty=0.0,
+                risk_penalty=0.0,
+                tracking_error_penalty=0.0,
+                total=safe_float(base_reward),
+            )
+
+        elif self.reward_type == RewardType.ALPHA_PENALIZED:
             base_reward = portfolio_return - benchmark_return
 
         elif self.reward_type == RewardType.INFORMATION_RATIO:
