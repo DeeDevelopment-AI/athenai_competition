@@ -400,7 +400,7 @@ class MarketSimulator:
         - Features de régimen
         """
         if self._state is None:
-            return np.zeros(self.n_algos * 4 + 3, dtype=np.float32)  # Placeholder
+            return np.zeros(self.n_algos * 4 + 4, dtype=np.float32)  # Placeholder
 
         current_date = self._state.current_date
         lookback = 21
@@ -464,16 +464,25 @@ class MarketSimulator:
         # 5. Drawdown actual
         drawdown = self._calculate_drawdown()
 
-        # 6. Exceso de retorno acumulado vs benchmark
-        if self._state.benchmark_value > 0:
-            excess = float(np.nan_to_num(
-                self._state.portfolio_value / self._state.benchmark_value - 1, nan=0.0
+        # 6. Momentum features (forward-looking signals, NOT realized returns)
+        # Cross-sectional momentum: fraction of algos with positive recent return
+        if n_hist >= 5:
+            momentum_breadth = float(np.nan_to_num(
+                (feat_ret5d > 0).mean(), nan=0.5
             ))
         else:
-            excess = 0.0
+            momentum_breadth = 0.5
+
+        # Volatility regime: current vol vs historical (high = risk-off signal)
+        if n_hist >= 21:
+            recent_vol = float(np.nan_to_num(feat_vol.mean(), nan=0.0))
+            # Normalize to ~[-1, 1] range assuming typical vol 10-30%
+            vol_regime = float(np.clip((recent_vol - 0.20) / 0.10, -2.0, 2.0))
+        else:
+            vol_regime = 0.0
 
         # Build observation with np.concatenate — 400× faster than list.extend + np.array
-        scalars = np.array([avg_corr, drawdown, excess], dtype=np.float32)
+        scalars = np.array([avg_corr, drawdown, momentum_breadth, vol_regime], dtype=np.float32)
         result = np.concatenate([feat_weights, feat_ret5d, feat_ret21d, feat_vol, scalars])
         np.nan_to_num(result, nan=0.0, posinf=1e6, neginf=-1e6, copy=False)
         return result

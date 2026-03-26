@@ -305,9 +305,9 @@ class TestGetObservation:
         simulator.reset()
         obs = simulator.get_observation()
 
-        # Dimension esperada: n_algos * 4 + 3 (pesos, ret_5d, ret_21d, vol, + 3 metricas)
-        # Basado en implementacion actual: n_algos*5 + 3
-        expected_dim = simulator.n_algos * 4 + 3
+        # Dimension esperada: n_algos * 4 + 4 (pesos, ret_5d, ret_21d, vol, + 4 metricas)
+        # 4 scalars: avg_corr, drawdown, momentum_breadth, vol_regime
+        expected_dim = simulator.n_algos * 4 + 4
         # Nota: La dimension real puede variar segun implementacion
         assert len(obs) > 0
 

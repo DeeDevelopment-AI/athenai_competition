@@ -264,7 +264,6 @@ class Phase1Runner(PhaseRunner):
                 self.logger.info(f"Computing features for {len(all_algo_ids_list)} algorithms...")
 
                 all_returns = returns_matrix[all_algo_ids_list].dropna(how='all')
-                all_returns.fillna(0, inplace=True)
                 all_returns = all_returns.astype(np.float32, copy=False)
                 self.logger.info(f"Returns matrix: {all_returns.shape} (float32)")
 

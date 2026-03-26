@@ -384,3 +384,42 @@ class TestGetSummaryStats:
 
         assert 'was_trimmed' in stats.columns
         assert stats.loc['trimmed', 'was_trimmed'] == True
+
+    def test_get_summary_stats_annualized_return_is_compounded(self, preprocessor):
+        """Annualized return should use geometric compounding, not arithmetic mean * 252."""
+        dates = pd.date_range('2020-01-01', periods=252, freq='D')
+        daily_return = 0.001
+        close = 100 * (1 + daily_return) ** np.arange(len(dates))
+        ohlc = pd.DataFrame({
+            'open': close,
+            'high': close,
+            'low': close,
+            'close': close,
+        }, index=dates)
+
+        algo = AlgorithmData('compounded', ohlc, Path('/tmp/compounded.csv'))
+        processed = {'compounded': preprocessor.process_algorithm(algo)}
+
+        stats = preprocessor.get_summary_stats(processed)
+        expected = (1 + daily_return) ** 252 - 1
+
+        assert stats.loc['compounded', 'annualized_return'] == pytest.approx(expected, rel=1e-4)
+
+
+class TestBenchmarkReturns:
+    """Tests for benchmark daily return reconstruction."""
+
+    def test_calculate_benchmark_daily_returns_does_not_backfill_future_weights(self, preprocessor):
+        """The first return should remain NaN without ex-ante weights."""
+        dates = pd.date_range('2020-01-01', periods=3, freq='D')
+        returns_matrix = pd.DataFrame({
+            'algo1': [0.01, 0.02, 0.03],
+        }, index=dates)
+        weights = pd.DataFrame({
+            'algo1': [1.0, 1.0, 1.0],
+        }, index=dates)
+
+        benchmark_returns = preprocessor.calculate_benchmark_daily_returns(returns_matrix, weights)
+
+        assert pd.isna(benchmark_returns.iloc[0])
+        assert benchmark_returns.iloc[1] == pytest.approx(0.02)

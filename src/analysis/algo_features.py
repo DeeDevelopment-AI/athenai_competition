@@ -8,6 +8,7 @@ Genera features en tres bloques:
 """
 
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -377,8 +378,10 @@ class AlgoFeatureExtractor:
         algo_ret = returns.reindex(common_idx).fillna(0)
         bench_ret = benchmark_returns.reindex(common_idx).fillna(0)
 
-        # Correlación
-        corr = algo_ret.corr(bench_ret)
+        # Correlación (with warning suppression for constant series)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            corr = algo_ret.corr(bench_ret)
 
         # Beta y Alpha (regresión)
         if bench_ret.std() > 0:
@@ -390,7 +393,9 @@ class AlgoFeatureExtractor:
             alpha = 0
 
         # Trend following score (correlación con benchmark rezagado)
-        trend_score = algo_ret.corr(bench_ret.shift(1).fillna(0))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            trend_score = algo_ret.corr(bench_ret.shift(1).fillna(0))
 
         # Tracking error e information ratio
         excess = algo_ret - bench_ret

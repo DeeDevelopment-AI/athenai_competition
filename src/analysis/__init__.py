@@ -26,6 +26,11 @@ from .algo_clusterer import (
     name_life_clusters,
     name_behavior_clusters,
 )
+from .pseudo_label_clusterer import (
+    PseudoLabelClusterer,
+    PseudoLabelStrategy,
+    PseudoLabelClusteringResult,
+)
 from .algo_features import (
     AlgoFeatureExtractor,
     AlgoFeatureConfig,
@@ -72,6 +77,9 @@ __all__ = [
     "name_clusters",
     "name_life_clusters",
     "name_behavior_clusters",
+    "PseudoLabelClusterer",
+    "PseudoLabelStrategy",
+    "PseudoLabelClusteringResult",
     # Feature extraction
     "AlgoFeatureExtractor",
     "AlgoFeatureConfig",

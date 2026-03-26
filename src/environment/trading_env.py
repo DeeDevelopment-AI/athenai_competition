@@ -1,9 +1,14 @@
 """
 Interfaz de entorno para agentes RL (compatible con SB3).
+
+Supports two modes:
+1. Standard mode: RL agent outputs absolute portfolio weights
+2. Hybrid mode: MPT base allocation + RL tilts (more stable training)
 """
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Optional
 
 import gymnasium as gym
@@ -18,6 +23,13 @@ from .reward import RewardFunction
 from .universe_encoder import AlgoUniverseEncoder
 
 logger = logging.getLogger(__name__)
+
+
+class BaseAllocatorType(Enum):
+    """Types of base allocators for hybrid mode."""
+    EQUAL_WEIGHT = "equal_weight"
+    RISK_PARITY = "risk_parity"  # Inverse volatility weighting
+    MIN_VARIANCE = "min_variance"  # Minimum variance (requires covariance)
 
 
 @dataclass
@@ -59,6 +71,11 @@ class TradingEnvironment(gym.Env):
         normalize_obs: bool = True,
         episode_config: Optional[EpisodeConfig] = None,
         encoder: Optional[AlgoUniverseEncoder] = None,
+        # Hybrid mode parameters
+        hybrid_mode: bool = False,
+        base_allocator: str = "risk_parity",
+        max_tilt: float = 0.15,
+        vol_lookback: int = 63,
     ):
         """
         Args:
@@ -77,6 +94,10 @@ class TradingEnvironment(gym.Env):
             encoder: Optional fitted AlgoUniverseEncoder.  When provided, the
                      observation/action spaces use the compressed PCA dimensions
                      and observations/actions are encoded/decoded automatically.
+            hybrid_mode: If True, use MPT base + RL tilts instead of absolute weights.
+            base_allocator: Base allocator type: "risk_parity", "equal_weight", "min_variance".
+            max_tilt: Maximum tilt per asset (e.g., 0.15 = ±15%).
+            vol_lookback: Lookback window for volatility calculation (risk parity).
         """
         super().__init__()
 
@@ -105,6 +126,12 @@ class TradingEnvironment(gym.Env):
         self.episode_config = episode_config or EpisodeConfig()
         self.encoder = encoder
 
+        # Hybrid mode: MPT base + RL tilts
+        self.hybrid_mode = hybrid_mode
+        self.max_tilt = max_tilt
+        self.vol_lookback = vol_lookback
+        self._base_allocator_type = BaseAllocatorType(base_allocator)
+
         self.n_algos = self.simulator.n_algos
 
         # Pre-compute available dates for episode sampling
@@ -116,7 +143,7 @@ class TradingEnvironment(gym.Env):
             obs_dim = encoder.obs_dim
             action_dim = encoder.action_dim
         else:
-            obs_dim = self.n_algos * 4 + 3
+            obs_dim = self.n_algos * 4 + 4  # weights, ret5d, ret21d, vol + 4 scalars
             action_dim = self.n_algos
 
         self.observation_space = spaces.Box(
@@ -126,13 +153,24 @@ class TradingEnvironment(gym.Env):
             dtype=np.float32,
         )
 
-        # Action range [0, 1] — normalized in step(); encoder decodes to full space
-        self.action_space = spaces.Box(
-            low=0.0,
-            high=1.0,
-            shape=(action_dim,),
-            dtype=np.float32,
-        )
+        # Action space depends on mode
+        if hybrid_mode:
+            # Hybrid mode: tilts in [-1, 1], will be scaled by max_tilt
+            self.action_space = spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(action_dim,),
+                dtype=np.float32,
+            )
+            logger.info(f"Hybrid mode enabled: {base_allocator} base + RL tilts (max_tilt={max_tilt})")
+        else:
+            # Standard mode: absolute weights in [0, 1]
+            self.action_space = spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(action_dim,),
+                dtype=np.float32,
+            )
 
         # Estado interno
         self._obs_mean: Optional[np.ndarray] = None
@@ -278,25 +316,41 @@ class TradingEnvironment(gym.Env):
         Ejecuta un paso en el entorno.
 
         Args:
-            action: Vector de pesos objetivo (pre-normalización).
+            action: In standard mode: target weights [0, 1].
+                    In hybrid mode: tilts [-1, 1] to add to base allocation.
 
         Returns:
             Tuple (obs, reward, terminated, truncated, info).
         """
         if self.encoder is not None:
             # Decode PCA action → full algo weight vector before simulator
-            sim_action = self.encoder.decode_action(action, self.simulator._state.current_date)
+            decoded_action = self.encoder.decode_action(action, self.simulator._state.current_date)
         else:
-            sim_action = action
+            decoded_action = action
 
-        # Normalizar acción para que sume a 1 (o menos)
-        sim_action = np.clip(sim_action, 0, 1)
-        action_sum = sim_action.sum()
-        if action_sum > 1:
-            sim_action = sim_action / action_sum
-        elif action_sum == 0:
-            # If all zeros, use equal weight
-            sim_action = np.ones(len(sim_action)) / len(sim_action)
+        if self.hybrid_mode:
+            # Hybrid mode: base allocation + RL tilts
+            base_weights = self._compute_base_weights()
+
+            # Scale tilts by max_tilt and apply
+            tilts = np.clip(decoded_action, -1.0, 1.0) * self.max_tilt
+            sim_action = base_weights + tilts
+
+            # Ensure non-negative and normalize
+            sim_action = np.maximum(sim_action, 0.0)
+            action_sum = sim_action.sum()
+            if action_sum > 0:
+                sim_action = sim_action / action_sum
+            else:
+                sim_action = np.ones(len(sim_action)) / len(sim_action)
+        else:
+            # Standard mode: absolute weights
+            sim_action = np.clip(decoded_action, 0, 1)
+            action_sum = sim_action.sum()
+            if action_sum > 1:
+                sim_action = sim_action / action_sum
+            elif action_sum == 0:
+                sim_action = np.ones(len(sim_action)) / len(sim_action)
 
         # Ejecutar paso en el simulador
         result = self.simulator.step(sim_action)
@@ -339,6 +393,90 @@ class TradingEnvironment(gym.Env):
         obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
 
         return obs.astype(np.float32)
+
+    def _compute_base_weights(self) -> np.ndarray:
+        """
+        Compute base allocation weights using the configured allocator.
+
+        Returns:
+            np.ndarray of weights summing to 1.
+        """
+        n = self.n_algos
+
+        if self._base_allocator_type == BaseAllocatorType.EQUAL_WEIGHT:
+            return np.ones(n, dtype=np.float32) / n
+
+        elif self._base_allocator_type == BaseAllocatorType.RISK_PARITY:
+            # Inverse volatility weighting
+            current_date = self.simulator._state.current_date
+
+            # Find current index in the returns array using searchsorted
+            current_idx = int(np.searchsorted(
+                self.simulator._returns_index_np,
+                np.datetime64(current_date),
+                side='right'
+            ))
+
+            # Get recent returns for volatility calculation
+            start_idx = max(0, current_idx - self.vol_lookback)
+            if start_idx >= current_idx or current_idx == 0:
+                return np.ones(n, dtype=np.float32) / n
+
+            recent_returns = self.simulator._returns_np[start_idx:current_idx, :]
+
+            if len(recent_returns) < 10:
+                return np.ones(n, dtype=np.float32) / n
+
+            # Compute volatilities (std of returns)
+            with np.errstate(invalid='ignore'):
+                vols = np.nanstd(recent_returns, axis=0)
+
+            # Handle zero or NaN volatility
+            vols = np.nan_to_num(vols, nan=1e-6, posinf=1e-6, neginf=1e-6)
+            vols = np.maximum(vols, 1e-8)
+
+            # Inverse volatility weights
+            inv_vols = 1.0 / vols
+            weights = inv_vols / inv_vols.sum()
+
+            return weights.astype(np.float32)
+
+        elif self._base_allocator_type == BaseAllocatorType.MIN_VARIANCE:
+            # Minimum variance (simplified: use inverse variance)
+            current_date = self.simulator._state.current_date
+
+            # Find current index in the returns array
+            current_idx = int(np.searchsorted(
+                self.simulator._returns_index_np,
+                np.datetime64(current_date),
+                side='right'
+            ))
+
+            start_idx = max(0, current_idx - self.vol_lookback)
+            if start_idx >= current_idx or current_idx == 0:
+                return np.ones(n, dtype=np.float32) / n
+
+            recent_returns = self.simulator._returns_np[start_idx:current_idx, :]
+
+            if len(recent_returns) < 10:
+                return np.ones(n, dtype=np.float32) / n
+
+            # Compute variances
+            with np.errstate(invalid='ignore'):
+                variances = np.nanvar(recent_returns, axis=0)
+
+            variances = np.nan_to_num(variances, nan=1e-6)
+            variances = np.maximum(variances, 1e-10)
+
+            # Inverse variance weights (simplified min variance)
+            inv_vars = 1.0 / variances
+            weights = inv_vars / inv_vars.sum()
+
+            return weights.astype(np.float32)
+
+        else:
+            # Default to equal weight
+            return np.ones(n, dtype=np.float32) / n
 
     def render(self) -> None:
         """Renderiza el estado actual (modo texto)."""

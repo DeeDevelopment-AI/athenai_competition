@@ -325,6 +325,47 @@ class TestPureReturnsReward:
         assert result.total == pytest.approx(-0.02)
 
 
+class TestCalibratedAlphaReward:
+    """Tests para reward tipo CALIBRATED_ALPHA."""
+
+    def test_calibrated_alpha_penalties_normalized(self):
+        """Penalties should be in comparable magnitude to alpha."""
+        reward_fn = RewardFunction(reward_type=RewardType.CALIBRATED_ALPHA)
+
+        result = reward_fn.compute(
+            portfolio_return=0.005,  # 0.5% weekly return
+            benchmark_return=0.003,  # 0.3% benchmark
+            transaction_costs=0.0007,  # 7 bps costs
+            turnover=0.15,  # 15% turnover
+            current_drawdown=-0.08,  # 8% drawdown (3% excess over 5% threshold)
+        )
+
+        # Alpha should be 0.002 (0.5% - 0.3%)
+        assert result.base_reward == pytest.approx(0.002)
+        # Cost penalty should equal transaction_costs
+        assert result.cost_penalty == pytest.approx(0.0007)
+        # Turnover penalty should be 0.15 * 0.01 = 0.0015
+        assert result.turnover_penalty == pytest.approx(0.0015)
+        # Drawdown penalty should be (0.08 - 0.05) * 0.05 = 0.0015
+        assert result.drawdown_penalty == pytest.approx(0.0015)
+        # All penalties should be comparable in magnitude (same order)
+        assert abs(result.cost_penalty) < 0.01
+        assert abs(result.turnover_penalty) < 0.01
+        assert abs(result.drawdown_penalty) < 0.01
+
+    def test_calibrated_alpha_no_drawdown_penalty_below_threshold(self):
+        """No drawdown penalty when below 5% threshold."""
+        reward_fn = RewardFunction(reward_type=RewardType.CALIBRATED_ALPHA)
+
+        result = reward_fn.compute(
+            portfolio_return=0.005,
+            benchmark_return=0.003,
+            current_drawdown=-0.03,  # 3% drawdown (below 5% threshold)
+        )
+
+        assert result.drawdown_penalty == 0.0
+
+
 class TestInformationRatioReward:
     """Tests para reward tipo INFORMATION_RATIO."""
 

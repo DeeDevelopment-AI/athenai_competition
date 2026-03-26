@@ -42,6 +42,19 @@ class TestActivityMask:
         assert mask.is_active.loc[dates[15], 'algo_1'] == False
         assert mask.is_active.loc[dates[55], 'algo_2'] == False
 
+    def test_zero_return_is_still_active(self):
+        """A zero return is an observed day, not inactivity."""
+        dates = pd.date_range('2020-01-01', periods=5, freq='D')
+        algo_returns = pd.DataFrame({
+            'algo_1': [0.01, 0.0, -0.01, np.nan, 0.0],
+        }, index=dates)
+
+        inference = LatentRegimeInference()
+        mask = inference.build_activity_mask(algo_returns)
+
+        assert mask.is_active.loc[dates[1], 'algo_1'] == True
+        assert mask.is_active.loc[dates[3], 'algo_1'] == False
+
     def test_no_9999999_values(self):
         """No debe haber valores 9999999 en la mascara."""
         dates = pd.date_range('2020-01-01', periods=50, freq='D')
@@ -156,6 +169,31 @@ class TestTemporalFeatures:
         # Verificar benchmark features
         assert bench_feat.returns is not None
         assert len(bench_feat.returns) == len(dates)
+
+    def test_observation_matrix_excludes_benchmark_allocation_features_by_default(self):
+        """Regime observations should not include benchmark allocation decisions by default."""
+        dates = pd.date_range('2020-01-01', periods=80, freq='D')
+        algo_returns = pd.DataFrame({
+            'algo_1': np.random.randn(80) * 0.01,
+            'algo_2': np.random.randn(80) * 0.01,
+        }, index=dates)
+        benchmark_weights = pd.DataFrame({
+            'algo_1': [0.5] * 80,
+            'algo_2': [0.5] * 80,
+        }, index=dates)
+        benchmark_returns = algo_returns.mean(axis=1)
+        family_labels = pd.Series([0, 1], index=['algo_1', 'algo_2'])
+
+        inference = LatentRegimeInference()
+        mask = inference.build_activity_mask(algo_returns)
+        family_agg, universe_feat, bench_feat = inference.build_temporal_features(
+            algo_returns, benchmark_weights, benchmark_returns, family_labels, mask
+        )
+        obs = inference._build_observation_matrix(family_agg, universe_feat, bench_feat)
+
+        assert 'bench_turnover' not in obs.columns
+        assert 'bench_concentration' not in obs.columns
+        assert not any(col.endswith('_wgt') for col in obs.columns)
 
 
 class TestRegimeInference:

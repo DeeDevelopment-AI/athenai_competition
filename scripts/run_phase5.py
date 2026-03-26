@@ -87,7 +87,7 @@ class TrainingConfig:
     # Environment
     initial_capital: float = 1_000_000.0
     rebalance_frequency: str = "weekly"
-    episode_length: int = 52  # weeks
+    episode_length: int = 104  # weeks (2 years - longer episodes for better learning)
     random_start: bool = True
 
     # Constraints
@@ -102,15 +102,14 @@ class TrainingConfig:
     impact_coefficient: float = 0.1
 
     # Reward
-    # Calibración: alpha semanal típico ~0.1% → reward_scale=100 → señal ~0.10
-    # cost_penalty=1.0: incluye costes reales (7bps×turnover ≈ 0.01 escalado) — mantener
-    # turnover_penalty: penalización ADICIONAL sobre costes. Con 0.1 y max_turnover=0.30
-    #   la penalización (3.0 escalada) aplasta la señal (0.10). Reducir 20×.
-    # drawdown_penalty: con 0.5 y 5% DD excess, penalización (2.5 escalada) >> señal.
+    # Options: "calibrated_alpha" (recommended), "pure_returns", "alpha_penalized"
+    # calibrated_alpha: penalties auto-normalized to be comparable to alpha signal
+    reward_type: str = "calibrated_alpha"
     reward_scale: float = 100.0
+    # Legacy penalty weights (only used with alpha_penalized, ignored by calibrated_alpha)
     cost_penalty: float = 1.0
-    turnover_penalty: float = 0.005   # was 0.1 — 20× reduction to let agent learn to trade
-    drawdown_penalty: float = 0.1     # was 0.5 — proportional to alpha signal magnitude
+    turnover_penalty: float = 0.005
+    drawdown_penalty: float = 0.1
 
     # Walk-forward
     train_ratio: float = 0.6
@@ -123,6 +122,11 @@ class TrainingConfig:
     n_pca_components: int = 50
     min_days_active: int = 21
     n_families: int = 8
+
+    # Hybrid mode: MPT base + RL tilts (recommended for stability)
+    hybrid_mode: bool = True  # Enable by default for better training stability
+    base_allocator: str = "risk_parity"  # "risk_parity", "equal_weight", "min_variance"
+    max_tilt: float = 0.15  # Maximum tilt per asset (±15%)
 
 
 def parse_timesteps(value: str) -> int:
@@ -323,6 +327,20 @@ class Phase5Runner(PhaseRunner):
             '--pca-encoder', action='store_true',
             help='Use PCA-based AlgoUniverseEncoder instead of FamilyEncoder (default: FamilyEncoder)'
         )
+        # Hybrid mode options
+        parser.add_argument(
+            '--no-hybrid', action='store_true',
+            help='Disable hybrid mode (use absolute weights instead of MPT base + tilts)'
+        )
+        parser.add_argument(
+            '--base-allocator', type=str, default='risk_parity',
+            choices=['risk_parity', 'equal_weight', 'min_variance'],
+            help='Base allocator for hybrid mode (default: risk_parity)'
+        )
+        parser.add_argument(
+            '--max-tilt', type=float, default=0.15,
+            help='Maximum tilt per asset in hybrid mode (default: 0.15 = ±15%%)'
+        )
         parser.add_argument(
             '--run-id', type=str, default=None,
             help=(
@@ -388,6 +406,10 @@ class Phase5Runner(PhaseRunner):
             use_family_encoder=not getattr(args, 'pca_encoder', False),
             n_pca_components=args.pca_components,
             min_days_active=args.min_days_active,
+            # Hybrid mode
+            hybrid_mode=not getattr(args, 'no_hybrid', False),
+            base_allocator=getattr(args, 'base_allocator', 'risk_parity'),
+            max_tilt=getattr(args, 'max_tilt', 0.15),
         )
 
         # ── Run ID: unique identifier for this training run ──────────────────
@@ -652,18 +674,34 @@ class Phase5Runner(PhaseRunner):
                     max_turnover=config.max_turnover,
                     max_exposure=config.max_exposure,
                 )
+                # Map reward_type string to enum
+                reward_type_map = {
+                    "calibrated_alpha": RewardType.CALIBRATED_ALPHA,
+                    "pure_returns": RewardType.PURE_RETURNS,
+                    "alpha_penalized": RewardType.ALPHA_PENALIZED,
+                    "info_ratio": RewardType.INFORMATION_RATIO,
+                    "risk_adjusted": RewardType.RISK_ADJUSTED,
+                }
+                reward_type = reward_type_map.get(config.reward_type, RewardType.CALIBRATED_ALPHA)
                 reward_fn = RewardFunction(
-                    reward_type=RewardType.ALPHA_PENALIZED,
+                    reward_type=reward_type,
                     cost_penalty_weight=config.cost_penalty,
                     turnover_penalty_weight=config.turnover_penalty,
                     drawdown_penalty_weight=config.drawdown_penalty,
                 )
+                self.logger.info(f"Using reward type: {config.reward_type}")
                 episode_config = EpisodeConfig(
                     random_start=config.random_start,
                     episode_length=config.episode_length,
                     min_episode_length=26,
                     warmup_periods=4,
                 )
+
+                # Log hybrid mode status
+                if config.hybrid_mode:
+                    self.logger.info(f"Hybrid mode: {config.base_allocator} base + RL tilts (max_tilt={config.max_tilt})")
+                else:
+                    self.logger.info("Standard mode: RL outputs absolute weights")
 
                 train_env = VecTradingEnv(
                     n_envs=n_envs,
@@ -679,6 +717,12 @@ class Phase5Runner(PhaseRunner):
                     reward_function=reward_fn,
                     episode_config=episode_config,
                     reward_scale=config.reward_scale,
+                    # Hybrid mode parameters
+                    hybrid_mode=config.hybrid_mode,
+                    base_allocator=config.base_allocator,
+                    max_tilt=config.max_tilt,
+                    # Encoder for dimensionality reduction (critical for stability!)
+                    encoder=encoder,
                 )
                 eval_episode_config = EpisodeConfig(
                     random_start=False,
@@ -699,6 +743,12 @@ class Phase5Runner(PhaseRunner):
                     reward_function=reward_fn,
                     episode_config=eval_episode_config,
                     reward_scale=config.reward_scale,
+                    # Hybrid mode parameters
+                    hybrid_mode=config.hybrid_mode,
+                    base_allocator=config.base_allocator,
+                    max_tilt=config.max_tilt,
+                    # Encoder for dimensionality reduction
+                    encoder=encoder,
                 )
 
                 from stable_baselines3.common.vec_env import VecNormalize

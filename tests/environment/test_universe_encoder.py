@@ -107,7 +107,8 @@ class TestStage3PCA:
         assert enc._n_components_actual <= enc.n_static_algos
 
     def test_obs_dim_matches_pca(self, fitted_encoder):
-        assert fitted_encoder.obs_dim == fitted_encoder._n_components_actual * 4 + 3
+        # 4 scalars: avg_corr, drawdown, momentum_breadth, vol_regime
+        assert fitted_encoder.obs_dim == fitted_encoder._n_components_actual * 4 + 4
 
     def test_action_dim_matches_pca(self, fitted_encoder):
         assert fitted_encoder.action_dim == fitted_encoder._n_components_actual
@@ -163,8 +164,8 @@ class TestStage2AliveMask:
 class TestEncodeObs:
     def _make_raw_obs(self, n_algos):
         rng = np.random.default_rng(1)
-        # Layout: [weights(n), ret5d(n), ret21d(n), vol(n), corr, dd, excess]
-        return rng.standard_normal(n_algos * 4 + 3).astype(np.float32)
+        # Layout: [weights(n), ret5d(n), ret21d(n), vol(n), corr, dd, momentum_breadth, vol_regime]
+        return rng.standard_normal(n_algos * 4 + 4).astype(np.float32)
 
     def test_output_shape(self, fitted_encoder, small_returns):
         n = fitted_encoder.n_total_algos
@@ -181,19 +182,19 @@ class TestEncodeObs:
         assert encoded.dtype == np.float32
 
     def test_scalars_preserved(self, fitted_encoder, small_returns):
-        """The 3 scalar features (corr, dd, excess) must be unchanged."""
+        """The 4 scalar features (corr, dd, momentum_breadth, vol_regime) must be unchanged."""
         n = fitted_encoder.n_total_algos
         raw_obs = self._make_raw_obs(n)
         date = small_returns.index[150]
         encoded = fitted_encoder.encode_obs(raw_obs, date)
         np.testing.assert_allclose(
-            encoded[-3:], raw_obs[4 * n :].astype(np.float32), rtol=1e-5
+            encoded[-4:], raw_obs[4 * n :].astype(np.float32), rtol=1e-5
         )
 
     def test_no_nan_in_output(self, fitted_encoder, small_returns):
         """Output must not contain NaN even if raw_obs has NaN."""
         n = fitted_encoder.n_total_algos
-        raw_obs = np.full(n * 4 + 3, np.nan, dtype=np.float32)
+        raw_obs = np.full(n * 4 + 4, np.nan, dtype=np.float32)
         date = small_returns.index[150]
         encoded = fitted_encoder.encode_obs(raw_obs, date)
         assert not np.isnan(encoded).any()
@@ -359,5 +360,5 @@ class TestTradingEnvironmentWithEncoder:
             encoder=None,
         )
         n = len(small_returns.columns)
-        assert env.observation_space.shape == (n * 4 + 3,)
+        assert env.observation_space.shape == (n * 4 + 4,)
         assert env.action_space.shape == (n,)

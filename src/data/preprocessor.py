@@ -608,10 +608,10 @@ class DataPreprocessor:
         weights_aligned = weights_copy.loc[common_dates, common_products]
 
         # Usar pesos del día anterior (decisión antes de observar retorno)
-        weights_lagged = weights_aligned.shift(1).bfill()
+        weights_lagged = weights_aligned.shift(1)
 
         # Retorno del portfolio = suma ponderada de retornos
-        benchmark_returns = (returns_aligned * weights_lagged).sum(axis=1)
+        benchmark_returns = (returns_aligned * weights_lagged).sum(axis=1, min_count=1)
         benchmark_returns.name = "benchmark"
 
         return benchmark_returns
@@ -647,7 +647,15 @@ class DataPreprocessor:
         stats_df['end_date'] = returns_matrix.apply(lambda x: x.dropna().index.max() if x.dropna().size > 0 else None)
         stats_df['mean_return_daily'] = returns_matrix.mean()
         stats_df['std_return_daily'] = returns_matrix.std()
-        stats_df['annualized_return'] = stats_df['mean_return_daily'] * 252
+        gross_return = (1 + returns_matrix).prod(skipna=True) - 1
+        years = stats_df['n_days'] / 252
+        stats_df['annualized_return'] = 0.0
+
+        valid_ann = (years > 0) & (gross_return > -1)
+        stats_df.loc[valid_ann, 'annualized_return'] = (
+            (1 + gross_return[valid_ann]) ** (1 / years[valid_ann]) - 1
+        )
+        stats_df.loc[gross_return <= -1, 'annualized_return'] = -1.0
         stats_df['annualized_volatility'] = stats_df['std_return_daily'] * np.sqrt(252)
 
         # Sharpe ratio (vectorized with safe division)

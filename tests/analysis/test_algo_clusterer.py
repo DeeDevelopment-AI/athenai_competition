@@ -121,12 +121,12 @@ class TestTemporalClustererInit:
         """Test basic initialization."""
         clusterer = TemporalAlgoClusterer(
             returns_matrix=sample_returns_matrix,
-            start_date='2020-01-01',
         )
 
         assert clusterer.n_clusters == 5  # Default
         assert clusterer.method == ClusterMethod.KMEANS
         assert len(clusterer.week_ends) > 0
+        assert clusterer.start_date == sample_returns_matrix.index.min()
 
     def test_init_custom_params(self, sample_returns_matrix):
         """Test initialization with custom parameters."""

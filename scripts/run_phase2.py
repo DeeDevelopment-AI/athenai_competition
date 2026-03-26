@@ -64,6 +64,24 @@ class Phase2Runner(PhaseRunner):
             help='Number of algorithm families'
         )
         parser.add_argument(
+            '--family-clustering-method', type=str, default='gmm',
+            choices=['kmeans', 'gmm', 'hierarchical', 'dbscan', 'hdbscan'],
+            help='Base clustering method for family pseudo-labels'
+        )
+        parser.add_argument(
+            '--family-refinement-strategy', type=str, default='direct',
+            choices=['none', 'direct', 'self_training', 'confidence_refinement', 'anomaly'],
+            help='XGBoost refinement strategy for family pseudo-labels'
+        )
+        parser.add_argument(
+            '--family-confidence-threshold', type=float, default=0.8,
+            help='Confidence threshold for confidence-based family refinement'
+        )
+        parser.add_argument(
+            '--family-refinement-max-iter', type=int, default=5,
+            help='Max refinement iterations for family pseudo-labeling'
+        )
+        parser.add_argument(
             '--skip-inference', action='store_true',
             help='Skip latent regime inference'
         )
@@ -96,6 +114,8 @@ class Phase2Runner(PhaseRunner):
                 'sample': args.sample,
                 'n_regimes': args.n_regimes,
                 'n_families': args.n_families,
+                'family_clustering_method': args.family_clustering_method,
+                'family_refinement_strategy': args.family_refinement_strategy,
                 'n_clusters': args.n_clusters,
                 'clustering_method': args.clustering_method,
             }
@@ -122,6 +142,7 @@ class Phase2Runner(PhaseRunner):
             returns_matrix = data['returns_matrix']
             benchmark_returns = data.get('benchmark_returns')
             benchmark_weights = data.get('benchmark_weights')
+            asset_inference = data.get('asset_inference')
 
             # Sample if requested
             if args.sample and args.sample < len(returns_matrix.columns):
@@ -255,6 +276,11 @@ class Phase2Runner(PhaseRunner):
                     LatentRegimeInference,
                     InferenceMethod,
                 )
+                from src.analysis.algo_clusterer import ClusterMethod, ScalerType
+                from src.analysis.pseudo_label_clusterer import (
+                    PseudoLabelClusterer,
+                    PseudoLabelStrategy,
+                )
 
                 inference = LatentRegimeInference(
                     n_regimes=args.n_regimes,
@@ -266,18 +292,81 @@ class Phase2Runner(PhaseRunner):
 
                 self.logger.info("Computing algorithm behavioral features...")
                 algo_features = inference.compute_algo_behavioral_features(returns_matrix, mask)
+                algo_features = self._augment_behavioral_features_with_asset_priors(
+                    algo_features,
+                    asset_inference,
+                )
                 (clustering_dir / 'behavioral').mkdir(parents=True, exist_ok=True)
                 algo_features.to_csv(clustering_dir / 'behavioral' / 'features.csv')
                 self.logger.info("Saved clustering/behavioral/features.csv")
 
-                self.logger.info(f"Assigning algorithms to {args.n_families} families...")
-                family_labels = inference.assign_families(
-                    algo_features,
-                    n_families=args.n_families,
-                    method='gmm'
+                self.logger.info(
+                    "Assigning algorithms to families "
+                    f"(base={args.family_clustering_method}, refine={args.family_refinement_strategy})..."
                 )
+                family_method_map = {
+                    'kmeans': ClusterMethod.KMEANS,
+                    'gmm': ClusterMethod.GMM,
+                    'hierarchical': ClusterMethod.HIERARCHICAL,
+                    'dbscan': ClusterMethod.DBSCAN,
+                    'hdbscan': ClusterMethod.HDBSCAN,
+                }
+                family_strategy_map = {
+                    'none': PseudoLabelStrategy.NONE,
+                    'direct': PseudoLabelStrategy.DIRECT,
+                    'self_training': PseudoLabelStrategy.SELF_TRAINING,
+                    'confidence_refinement': PseudoLabelStrategy.CONFIDENCE,
+                    'anomaly': PseudoLabelStrategy.ANOMALY,
+                }
+
+                family_clusterer = PseudoLabelClusterer(
+                    base_method=family_method_map[args.family_clustering_method],
+                    n_clusters=args.n_families,
+                    strategy=family_strategy_map[args.family_refinement_strategy],
+                    random_state=42,
+                    scaler_type=ScalerType.ROBUST,
+                    confidence_threshold=args.family_confidence_threshold,
+                    max_iter=args.family_refinement_max_iter,
+                )
+                family_result = family_clusterer.fit_predict(algo_features)
+                base_family_labels = family_result.base_labels.rename('base_family')
+                family_labels = family_result.refined_labels.rename('family')
+
+                base_family_labels.to_csv(clustering_dir / 'behavioral' / 'base_family_labels.csv')
                 family_labels.to_csv(clustering_dir / 'behavioral' / 'family_labels.csv')
-                self.logger.info("Saved algo_family_labels.csv")
+                self.logger.info("Saved base_family_labels.csv and family_labels.csv")
+
+                family_probs = family_result.class_probabilities.copy()
+                family_probs.columns = [f'family_{col}' for col in family_probs.columns]
+                family_probs.to_parquet(clustering_dir / 'behavioral' / 'family_probabilities.parquet')
+                self.logger.info("Saved family_probabilities.parquet")
+
+                family_result.confidence.to_csv(clustering_dir / 'behavioral' / 'family_confidence.csv')
+                self.logger.info("Saved family_confidence.csv")
+
+                if not family_result.feature_importance.empty:
+                    family_result.feature_importance.rename('importance').to_csv(
+                        clustering_dir / 'behavioral' / 'family_feature_importance.csv'
+                    )
+                    self.logger.info("Saved family_feature_importance.csv")
+
+                if family_result.anomaly_score.notna().any():
+                    family_result.anomaly_score.to_csv(clustering_dir / 'behavioral' / 'family_anomaly_score.csv')
+                    self.logger.info("Saved family_anomaly_score.csv")
+
+                refinement_summary = {
+                    'base_method': family_result.base_method.value,
+                    'strategy': family_result.strategy.value,
+                    'metadata': family_result.metadata,
+                    'n_base_clusters': int(base_family_labels[base_family_labels >= 0].nunique()),
+                    'n_final_clusters': int(family_labels[family_labels >= 0].nunique()),
+                    'n_noise_base': int((base_family_labels < 0).sum()),
+                    'n_noise_final': int((family_labels < 0).sum()),
+                    'mean_confidence': float(family_result.confidence.mean()),
+                }
+                with open(clustering_dir / 'behavioral' / 'family_refinement.json', 'w', encoding='utf-8') as f:
+                    json.dump(refinement_summary, f, indent=2, default=str)
+                self.logger.info("Saved family_refinement.json")
 
                 # Family distribution
                 family_counts = family_labels.value_counts().sort_index()
@@ -357,6 +446,8 @@ class Phase2Runner(PhaseRunner):
                 results['regime_inference'] = {
                     'n_regimes': args.n_regimes,
                     'n_families': args.n_families,
+                    'family_clustering_method': args.family_clustering_method,
+                    'family_refinement_strategy': args.family_refinement_strategy,
                     'regime_names': regime_result.regime_names,
                     'log_likelihood': regime_result.log_likelihood,
                     'bic': regime_result.bic,
@@ -467,8 +558,13 @@ class Phase2Runner(PhaseRunner):
                     )
 
                     # Run clustering with comparison of methods
+                    comparison_methods = [method]
+                    for candidate in [ClusterMethod.KMEANS, ClusterMethod.GMM]:
+                        if candidate not in comparison_methods:
+                            comparison_methods.append(candidate)
+
                     output = clusterer.run(
-                        methods=[ClusterMethod.KMEANS, ClusterMethod.GMM],
+                        methods=comparison_methods,
                         save_path=str(temporal_output),
                     )
 
@@ -530,23 +626,24 @@ class Phase2Runner(PhaseRunner):
         """
         data = {}
 
-        # Load returns matrix - try new path first, then legacy
-        returns_path = self.dp.algorithms.returns
-        if not returns_path.exists():
-            # Fallback to legacy flat structure
-            returns_path = input_dir / 'algo_returns.parquet'
-        if not returns_path.exists():
-            raise FileNotFoundError(f"Returns matrix not found: {returns_path}")
+        returns_path = self._resolve_input_path(
+            input_dir,
+            self.dp.algorithms.returns,
+            ['algorithms/returns.parquet', 'algo_returns.parquet'],
+        )
+        if returns_path is None or not returns_path.exists():
+            raise FileNotFoundError("Returns matrix not found in input_dir or default processed paths")
 
         returns_matrix = pd.read_parquet(returns_path)
         returns_matrix = returns_matrix.astype(np.float32, copy=False)
         data['returns_matrix'] = returns_matrix
         self.logger.info(f"Loaded returns matrix: {returns_matrix.shape}")
 
-        # Load benchmark returns - try new path first, then legacy
-        bench_path = self.dp.benchmark.daily_returns
-        if not bench_path.exists():
-            bench_path = input_dir / 'benchmark_daily_returns.csv'
+        bench_path = self._resolve_input_path(
+            input_dir,
+            self.dp.benchmark.daily_returns,
+            ['benchmark/daily_returns.csv', 'benchmark_daily_returns.csv'],
+        )
         if bench_path.exists():
             bench_df = pd.read_csv(bench_path, index_col=0, parse_dates=True)
             if 'return' in bench_df.columns:
@@ -555,11 +652,12 @@ class Phase2Runner(PhaseRunner):
                 data['benchmark_returns'] = bench_df.iloc[:, 0]
             self.logger.info(f"Loaded benchmark returns: {len(data['benchmark_returns'])} days")
 
-        # Load benchmark weights - try new path first, then legacy
-        weights_path = self.dp.benchmark.weights
-        if not weights_path.exists():
-            weights_path = input_dir / 'benchmark_weights.parquet'
-        if weights_path.exists():
+        weights_path = self._resolve_input_path(
+            input_dir,
+            self.dp.benchmark.weights,
+            ['benchmark/weights.parquet', 'benchmark_weights.parquet'],
+        )
+        if weights_path is not None and weights_path.exists():
             benchmark_weights = pd.read_parquet(weights_path)
             benchmark_weights = benchmark_weights.astype(np.float32, copy=False)
             data['benchmark_weights'] = benchmark_weights
@@ -568,7 +666,74 @@ class Phase2Runner(PhaseRunner):
             data['benchmark_weights'] = None
             self.logger.info("Benchmark weights not found")
 
+        asset_inference_path = self._resolve_input_path(
+            input_dir,
+            self.dp.algorithms.asset_inference,
+            ['algorithms/asset_inference.csv', 'asset_inference.csv'],
+        )
+        if asset_inference_path is not None and asset_inference_path.exists():
+            data['asset_inference'] = pd.read_csv(asset_inference_path)
+            self.logger.info(f"Loaded asset inference: {len(data['asset_inference'])} rows")
+        else:
+            data['asset_inference'] = None
+            self.logger.info("Asset inference not found")
+
         return data
+
+    def _resolve_input_path(self, input_dir: Path, default_path: Path, relative_candidates: list[str]) -> Path | None:
+        """Resolve input artifacts, giving explicit input_dir precedence."""
+        candidates = [input_dir / rel for rel in relative_candidates]
+        try:
+            if default_path is not None:
+                candidates.append(Path(default_path))
+        except TypeError:
+            pass
+
+        seen = set()
+        for candidate in candidates:
+            candidate = Path(candidate)
+            candidate_key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+            if candidate_key in seen:
+                continue
+            seen.add(candidate_key)
+            if candidate.exists():
+                return candidate
+
+        return candidates[0] if candidates else None
+
+    def _augment_behavioral_features_with_asset_priors(
+        self,
+        algo_features: pd.DataFrame,
+        asset_inference: pd.DataFrame | None,
+        min_confidence: float = 60.0,
+    ) -> pd.DataFrame:
+        """Add weak priors from Phase 1 asset inference to family clustering."""
+        if asset_inference is None or asset_inference.empty or 'algo_id' not in asset_inference.columns:
+            return algo_features
+
+        inference_df = asset_inference.drop_duplicates(subset=['algo_id']).set_index('algo_id')
+        inference_df = inference_df.reindex(algo_features.index)
+
+        priors = pd.DataFrame(index=algo_features.index, dtype=float)
+
+        confidence = pd.to_numeric(inference_df.get('confidence'), errors='coerce').fillna(0.0)
+        priors['prior_asset_confidence'] = (confidence / 100.0).clip(0, 1)
+
+        confident = confidence >= min_confidence
+        asset_classes = inference_df.get('asset_class')
+        if asset_classes is not None:
+            asset_classes = asset_classes.fillna('unknown').astype(str).str.lower()
+            for asset_class in sorted(c for c in asset_classes.unique() if c not in {'unknown', 'error', 'nan'}):
+                priors[f'prior_asset_{asset_class}'] = ((asset_classes == asset_class) & confident).astype(float)
+
+        directions = inference_df.get('direction')
+        if directions is not None:
+            directions = directions.fillna('unknown').astype(str).str.lower()
+            for direction in sorted(d for d in directions.unique() if d not in {'unknown', 'nan'}):
+                safe_direction = direction.replace('/', '_').replace(' ', '_')
+                priors[f'prior_direction_{safe_direction}'] = ((directions == direction) & confident).astype(float)
+
+        return pd.concat([algo_features, priors], axis=1)
 
     def _generate_markdown_report(self, results: dict, output_dir: Path):
         """Generate markdown summary report."""

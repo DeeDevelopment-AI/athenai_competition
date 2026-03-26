@@ -339,6 +339,25 @@ class TestPhase2EdgeCases:
                     '--no-report',
                 ])
 
+    def test_input_dir_takes_precedence_over_default_paths(self, mock_phase1_data, tmp_path):
+        """Explicit --input-dir should win over default processed paths."""
+        runner = Phase2Runner()
+
+        wrong_root = tmp_path / 'wrong'
+        (wrong_root / 'algorithms').mkdir(parents=True, exist_ok=True)
+        wrong_returns = pd.DataFrame({'wrong_algo': [0.1, 0.2]}, index=pd.date_range('2020-01-01', periods=2, freq='D'))
+        wrong_returns.to_parquet(wrong_root / 'algorithms' / 'returns.parquet')
+
+        with patch.object(runner, 'dp') as mock_dp:
+            mock_dp.algorithms.returns = wrong_root / 'algorithms' / 'returns.parquet'
+            mock_dp.algorithms.asset_inference = wrong_root / 'algorithms' / 'asset_inference.csv'
+            mock_dp.benchmark.daily_returns = wrong_root / 'benchmark' / 'daily_returns.csv'
+            mock_dp.benchmark.weights = wrong_root / 'benchmark' / 'weights.parquet'
+
+            data = runner._load_phase1_data(mock_phase1_data)
+
+        assert 'wrong_algo' not in data['returns_matrix'].columns
+
 
 # =============================================================================
 # Integration tests

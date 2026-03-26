@@ -17,6 +17,7 @@ class RewardType(Enum):
     RISK_ADJUSTED = "risk_adjusted"
     DIVERSIFIED = "diversified"
     PURE_RETURNS = "pure_returns"  # Maximize returns only, no penalties
+    CALIBRATED_ALPHA = "calibrated_alpha"  # Alpha with normalized penalties
 
 
 @dataclass
@@ -163,6 +164,33 @@ class RewardFunction:
         elif self.reward_type == RewardType.DIVERSIFIED:
             base_reward = portfolio_return - benchmark_return
             # Bonus se añade abajo
+
+        elif self.reward_type == RewardType.CALIBRATED_ALPHA:
+            # Calibrated alpha: penalties normalized to be comparable in magnitude
+            # All terms scaled to be in similar range (~0.001 to ~0.01 for typical values)
+            alpha = portfolio_return - benchmark_return
+
+            # Normalize penalties to alpha scale (weekly returns ~0.1% to 1%)
+            # Costs are already in return units, no change needed
+            norm_cost = transaction_costs
+            # Turnover 0-30% → penalty ~0-0.003 (10x less than alpha)
+            norm_turnover = turnover * 0.01
+            # Drawdown 0-20% → penalty ~0-0.01 when exceeds threshold
+            dd_excess = max(0, abs(current_drawdown) - self.drawdown_threshold)
+            norm_dd = dd_excess * 0.05
+
+            # Total with soft penalties (don't dominate alpha signal)
+            total = alpha - norm_cost - norm_turnover - norm_dd
+
+            return RewardComponents(
+                base_reward=safe_float(alpha),
+                cost_penalty=safe_float(norm_cost),
+                turnover_penalty=safe_float(norm_turnover),
+                drawdown_penalty=safe_float(norm_dd),
+                risk_penalty=0.0,
+                tracking_error_penalty=0.0,
+                total=safe_float(total),
+            )
 
         else:
             base_reward = portfolio_return - benchmark_return

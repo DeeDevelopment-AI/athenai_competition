@@ -440,6 +440,7 @@ class LatentRegimeInference:
         vol_window: int = 21,
         correlation_window: int = 63,
         random_state: int = 42,
+        use_benchmark_allocation_features: bool = False,
     ):
         self.n_regimes = n_regimes
         self.min_active_algos = min_active_algos
@@ -447,6 +448,7 @@ class LatentRegimeInference:
         self.vol_window = vol_window
         self.correlation_window = correlation_window
         self.random_state = random_state
+        self.use_benchmark_allocation_features = use_benchmark_allocation_features
 
         self._scaler = RobustScaler()
         self._hmm_model = None
@@ -479,8 +481,9 @@ class LatentRegimeInference:
         Returns:
             ActivityMask con is_active, time_since_last, time_until_next
         """
-        # An algorithm is "active" if return is NOT NaN AND NOT zero
-        is_active = (~algo_returns.isna()) & (algo_returns != 0)
+        # An algorithm is active when it has an observed return.
+        # Zero return is still activity.
+        is_active = ~algo_returns.isna()
 
         # Convert index to numeric (days since epoch) for efficient computation
         timestamps = algo_returns.index
@@ -622,117 +625,107 @@ class LatentRegimeInference:
         valid_mask = valid_counts >= 30
 
         # Initialize result DataFrame
-        result = pd.DataFrame(index=algo_returns.columns)
+        result = pd.DataFrame(index=algo_returns.columns, dtype=float)
 
         # Calcular retorno del universo como proxy
         universe_return = algo_returns.mean(axis=1, skipna=True)
-        universe_drawdown = self._compute_drawdown_series(universe_return)
 
         # ===== Vectorized basic performance metrics =====
         result['ann_return'] = algo_returns.mean() * 252
         result['ann_vol'] = algo_returns.std() * np.sqrt(252)
 
-        # Sharpe ratio (vectorized with safe division)
         with np.errstate(divide='ignore', invalid='ignore'):
             result['sharpe'] = np.where(
                 result['ann_vol'] > 0,
                 result['ann_return'] / result['ann_vol'],
-                0
+                np.nan,
             )
 
-        # Sortino (downside vol) - needs per-column computation for downside
         downside_returns = algo_returns.clip(upper=0)
         downside_vol = downside_returns.std() * np.sqrt(252)
         with np.errstate(divide='ignore', invalid='ignore'):
             result['sortino'] = np.where(
                 downside_vol > 0,
                 result['ann_return'] / downside_vol,
-                result['sharpe']  # Fall back to Sharpe if no downside
+                result['sharpe'],
             )
 
-        # Max drawdown (vectorized)
-        equity = (1 + algo_returns.fillna(0)).cumprod()
-        running_max = equity.cummax()
-        with np.errstate(divide='ignore', invalid='ignore'):
-            drawdown = (equity - running_max) / running_max
-        result['max_dd'] = drawdown.min()
+        # Path-dependent metrics must respect missingness.
+        max_dd = pd.Series(np.nan, index=algo_returns.columns, dtype=float)
+        beta_universe = pd.Series(np.nan, index=algo_returns.columns, dtype=float)
+        beta_drawdowns = pd.Series(np.nan, index=algo_returns.columns, dtype=float)
 
-        # ===== Vectorized distribution metrics =====
+        universe_sum = algo_returns.sum(axis=1, skipna=True)
+        universe_count = algo_returns.notna().sum(axis=1)
+
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            autocorr_1 = algo_returns.apply(
+                lambda x: x.dropna().autocorr(lag=1) if x.notna().sum() > 5 else np.nan
+            )
+            autocorr_5 = algo_returns.apply(
+                lambda x: x.dropna().autocorr(lag=5) if x.notna().sum() > 10 else np.nan
+            )
+
+        result['autocorr_1'] = autocorr_1
+        result['autocorr_5'] = autocorr_5
         result['skewness'] = algo_returns.skew()
         result['kurtosis'] = algo_returns.kurtosis()
 
-        # Tail ratio (vectorized)
         p95 = algo_returns.quantile(0.95)
         p05 = algo_returns.quantile(0.05)
         with np.errstate(divide='ignore', invalid='ignore'):
             tail_ratio = np.abs(p95 / p05)
-        result['tail_ratio'] = np.clip(tail_ratio.fillna(1.0), 0, 10)
+        result['tail_ratio'] = np.clip(tail_ratio, 0, 10)
 
-        # ===== Autocorrelation (needs loop but optimized) =====
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            autocorr_1 = algo_returns.apply(lambda x: x.autocorr(lag=1) if x.notna().sum() > 5 else 0)
-            autocorr_5 = algo_returns.apply(lambda x: x.autocorr(lag=5) if x.notna().sum() > 10 else 0)
-        result['autocorr_1'] = autocorr_1.fillna(0)
-        result['autocorr_5'] = autocorr_5.fillna(0)
+        for algo_id in algo_returns.columns:
+            algo_series = algo_returns[algo_id].dropna()
+            if len(algo_series) < 30:
+                continue
 
-        # ===== Beta to universe (vectorized correlation) =====
-        # Compute beta_universe using corrwith and covariance
-        import warnings
-        combined = algo_returns.join(universe_return.rename('_universe_'), how='inner')
-        if len(combined) > 30:
-            universe_col = combined['_universe_']
-            algo_cols = combined.drop(columns=['_universe_'])
-
-            # Covariance with universe (suppress warnings for small samples)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                cov_with_universe = algo_cols.apply(lambda x: x.cov(universe_col))
-                var_universe = universe_col.var()
-
+            equity = (1 + algo_series).cumprod()
+            running_max = equity.cummax()
             with np.errstate(divide='ignore', invalid='ignore'):
-                result['beta_universe'] = np.where(
-                    var_universe > 1e-10,
-                    cov_with_universe / var_universe,
-                    0
+                drawdown = (equity - running_max) / running_max
+            max_dd.loc[algo_id] = drawdown.min()
+
+            other_count = universe_count - algo_returns[algo_id].notna().astype(int)
+            leave_one_out = pd.Series(np.nan, index=algo_returns.index, dtype=float)
+            valid_other = other_count > 0
+            leave_one_out.loc[valid_other] = (
+                universe_sum.loc[valid_other] - algo_returns[algo_id].fillna(0).loc[valid_other]
+            ) / other_count.loc[valid_other]
+
+            aligned = pd.concat(
+                [algo_returns[algo_id], leave_one_out.rename('_universe_')],
+                axis=1,
+                join='inner',
+            ).dropna()
+            if len(aligned) >= 30 and aligned['_universe_'].var() > 1e-10:
+                beta_universe.loc[algo_id] = (
+                    aligned.iloc[:, 0].cov(aligned['_universe_']) / aligned['_universe_'].var()
                 )
+                leave_one_out_dd = self._compute_drawdown_series(aligned['_universe_'])
+                beta_drawdowns.loc[algo_id] = aligned.iloc[:, 0].corr(leave_one_out_dd)
 
-            # Beta to drawdowns (correlation with universe drawdown)
-            combined_dd = algo_cols.join(universe_drawdown.rename('_dd_'), how='inner')
-            if len(combined_dd) > 30:
-                dd_col = combined_dd['_dd_']
-                algo_dd_cols = combined_dd.drop(columns=['_dd_'])
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    result['beta_drawdowns'] = algo_dd_cols.corrwith(dd_col).fillna(0)
-            else:
-                result['beta_drawdowns'] = 0
-        else:
-            result['beta_universe'] = 0
-            result['beta_drawdowns'] = 0
+        result['max_dd'] = max_dd
+        result['beta_universe'] = beta_universe
+        result['beta_drawdowns'] = beta_drawdowns
 
-        # ===== Stability metrics (rolling Sharpe stability) =====
-        # Compute rolling mean and std for Sharpe
         rolling_mean = algo_returns.rolling(63, min_periods=30).mean()
         rolling_std = algo_returns.rolling(63, min_periods=30).std()
 
         with np.errstate(divide='ignore', invalid='ignore'):
             rolling_sharpe = (rolling_mean / rolling_std) * np.sqrt(252)
 
-        sharpe_stability = 1 / (rolling_sharpe.std() + 0.01)
-        result['sharpe_stability'] = sharpe_stability.fillna(0)
+        result['sharpe_stability'] = 1 / (rolling_sharpe.std() + 0.01)
 
-        # Return stability
         rolling_vol = algo_returns.rolling(21, min_periods=10).std()
-        return_stability = 1 / (rolling_vol.std() + 0.01)
-        result['return_stability'] = return_stability.fillna(0)
+        result['return_stability'] = 1 / (rolling_vol.std() + 0.01)
 
-        # ===== Filter out algos with insufficient data =====
         result.loc[~valid_mask] = np.nan
-
-        # Replace any remaining NaN/inf with 0
-        result = result.replace([np.inf, -np.inf], np.nan).fillna(0)
+        result = result.replace([np.inf, -np.inf], np.nan)
 
         return result
 
@@ -766,8 +759,17 @@ class LatentRegimeInference:
         from sklearn.mixture import GaussianMixture
         from sklearn.cluster import KMeans
 
-        # Preparar features
-        X = algo_features.replace([np.inf, -np.inf], np.nan).fillna(algo_features.median())
+        # Preparar features y separar algoritmos con datos insuficientes.
+        clean_features = algo_features.replace([np.inf, -np.inf], np.nan)
+        valid_rows = clean_features.notna().sum(axis=1) >= max(3, clean_features.shape[1] // 3)
+
+        labels_full = pd.Series(-1, index=algo_features.index, name='family', dtype=int)
+        if valid_rows.sum() == 0:
+            logger.warning("No algorithms with enough behavioral features for family assignment")
+            return labels_full
+
+        X = clean_features.loc[valid_rows].copy()
+        X = X.fillna(X.median())
         X_scaled = self._scaler.fit_transform(X)
 
         # Clusterizar
@@ -801,16 +803,18 @@ class LatentRegimeInference:
 
         # Asignar nombres interpretativos
         if family_names is None:
-            family_names = self._generate_family_names(algo_features, labels)
+            family_names = self._generate_family_names(X, labels)
 
-        logger.info(f"Assigned {len(set(labels))} families to {len(labels)} algorithms")
+        labels_full.loc[valid_rows] = labels
+
+        logger.info(f"Assigned {len(set(labels[labels >= 0]))} families to {valid_rows.sum()} algorithms")
         for fam_id in sorted(set(labels)):
             if fam_id >= 0:
                 count = (labels == fam_id).sum()
                 name = family_names.get(fam_id, f"family_{fam_id}")
                 logger.info(f"  {fam_id}: {name} ({count} algos)")
 
-        return pd.Series(labels, index=algo_features.index, name='family')
+        return labels_full
 
     def _generate_family_names(
         self,
@@ -1199,6 +1203,9 @@ class LatentRegimeInference:
 
             for i in range(window, len(returns)):
                 window_data = returns_subset.iloc[i-window:i].dropna(axis=1, how='all')
+                # Filter out constant columns (zero variance)
+                non_const_cols = window_data.std() > 1e-10
+                window_data = window_data.loc[:, non_const_cols]
                 if window_data.shape[1] < 3:
                     continue
 
@@ -1355,12 +1362,10 @@ class LatentRegimeInference:
         """Construye matriz de observacion para inferencia."""
         obs = pd.DataFrame(index=benchmark_features.returns.index)
 
-        # Features del benchmark
+        # Features del benchmark ex-post market state
         obs['bench_return'] = benchmark_features.returns
         obs['bench_vol'] = benchmark_features.volatility
         obs['bench_dd'] = benchmark_features.drawdown
-        obs['bench_turnover'] = benchmark_features.turnover
-        obs['bench_concentration'] = benchmark_features.concentration_hhi
 
         # Features del universo
         obs['univ_dispersion'] = universe_features.cross_sectional_dispersion
@@ -1373,14 +1378,17 @@ class LatentRegimeInference:
         for col in family_features.returns.columns:
             obs[f'fam_{col}_ret'] = family_features.returns[col]
 
-        # Pesos por familia
-        for col in family_features.weights.columns:
-            obs[f'fam_{col}_wgt'] = family_features.weights[col]
+        # Optional benchmark allocation features. Disabled by default to avoid
+        # circular regime definitions based on the benchmark decisions themselves.
+        if self.use_benchmark_allocation_features:
+            obs['bench_turnover'] = benchmark_features.turnover
+            obs['bench_concentration'] = benchmark_features.concentration_hhi
+            for col in family_features.weights.columns:
+                obs[f'fam_{col}_wgt'] = family_features.weights[col]
 
         # Limpiar
         obs = obs.replace([np.inf, -np.inf], np.nan)
         obs = obs.dropna(how='all')
-        obs = obs.ffill().bfill().fillna(0)
 
         return obs
 
@@ -1392,8 +1400,13 @@ class LatentRegimeInference:
             logger.warning("hmmlearn not installed, falling back to temporal clustering")
             return self._infer_temporal_clustering(obs_matrix)
 
+        prepared_obs = obs_matrix.ffill().dropna()
+        if prepared_obs.empty:
+            logger.warning("No observations available for HMM after preparation; falling back to temporal clustering")
+            return self._infer_temporal_clustering(obs_matrix)
+
         # Normalizar
-        X = self._scaler.fit_transform(obs_matrix.values)
+        X = self._scaler.fit_transform(prepared_obs.values)
 
         # Ajustar HMM
         model = hmm.GaussianHMM(
@@ -1415,8 +1428,8 @@ class LatentRegimeInference:
             # Log likelihood y BIC
             log_likelihood = model.score(X)
             n_params = (
-                self.n_regimes * obs_matrix.shape[1] +  # means
-                self.n_regimes * obs_matrix.shape[1] * (obs_matrix.shape[1] + 1) / 2 +  # covs
+                self.n_regimes * prepared_obs.shape[1] +  # means
+                self.n_regimes * prepared_obs.shape[1] * (prepared_obs.shape[1] + 1) / 2 +  # covs
                 self.n_regimes ** 2  # transitions
             )
             bic = -2 * log_likelihood + n_params * np.log(len(X))
@@ -1433,16 +1446,18 @@ class LatentRegimeInference:
             for state_id in range(self.n_regimes):
                 state_mask = states == state_id
                 if state_mask.sum() > 0:
-                    state_obs = obs_matrix.iloc[state_mask]
+                    state_obs = prepared_obs.iloc[state_mask]
                     regime_profiles[state_id] = state_obs.mean().to_dict()
 
-            # Labels y probabilidades como Series/DataFrame
-            regime_labels = pd.Series(states, index=obs_matrix.index, name='regime')
+            # Labels y probabilidades sobre el indice completo, preservando NaN
+            regime_labels = pd.Series(np.nan, index=obs_matrix.index, name='regime')
+            regime_labels.loc[prepared_obs.index] = states
             regime_probs = pd.DataFrame(
-                probs,
+                np.nan,
                 index=obs_matrix.index,
                 columns=[f'regime_{i}' for i in range(self.n_regimes)]
             )
+            regime_probs.loc[prepared_obs.index] = probs
 
             logger.info(f"HMM fitted: {self.n_regimes} regimes, log_lik={log_likelihood:.2f}")
 
@@ -1455,7 +1470,7 @@ class LatentRegimeInference:
                 transition_matrix=trans_matrix,
                 log_likelihood=log_likelihood,
                 bic=bic,
-                silhouette_temporal=self._compute_temporal_silhouette(states, obs_matrix),
+                silhouette_temporal=self._compute_temporal_silhouette(states, prepared_obs),
             )
 
         except Exception as e:
@@ -1466,9 +1481,28 @@ class LatentRegimeInference:
         """Infiere regimenes con clustering temporal sobre ventanas rolling."""
         from sklearn.mixture import GaussianMixture
 
+        prepared_obs = obs_matrix.ffill().dropna()
+        if prepared_obs.empty:
+            empty_probs = pd.DataFrame(
+                np.nan,
+                index=obs_matrix.index,
+                columns=[f'regime_{i}' for i in range(self.n_regimes)],
+            )
+            return LatentRegimeResult(
+                regime_labels=pd.Series(np.nan, index=obs_matrix.index, name='regime'),
+                regime_probabilities=empty_probs,
+                fuzzy_memberships=pd.DataFrame(),
+                regime_profiles={},
+                regime_names={},
+                transition_matrix=pd.DataFrame(),
+                log_likelihood=0,
+                bic=0,
+                silhouette_temporal=np.nan,
+            )
+
         # Rolling features
         window = 21
-        rolling_features = obs_matrix.rolling(window).mean().dropna()
+        rolling_features = prepared_obs.rolling(window).mean().dropna()
 
         # Normalizar
         X = self._scaler.fit_transform(rolling_features.values)
@@ -1484,13 +1518,8 @@ class LatentRegimeInference:
         probs = model.predict_proba(X)
 
         # Mapear a indice original
-        regime_labels = pd.Series(
-            np.nan,
-            index=obs_matrix.index,
-            name='regime'
-        )
+        regime_labels = pd.Series(np.nan, index=obs_matrix.index, name='regime')
         regime_labels.loc[rolling_features.index] = labels
-        regime_labels = regime_labels.bfill().fillna(0).astype(int)
 
         regime_probs = pd.DataFrame(
             index=obs_matrix.index,
@@ -1498,7 +1527,6 @@ class LatentRegimeInference:
             dtype=float
         )
         regime_probs.loc[rolling_features.index] = probs
-        regime_probs = regime_probs.bfill().fillna(1/self.n_regimes)
 
         # Caracterizar
         regime_profiles = {}
@@ -1874,6 +1902,20 @@ class LatentRegimeInference:
         common_idx = weights_by_family.index.intersection(regime_labels.index)
         weights_by_family_aligned = weights_by_family.loc[common_idx]
         regime_labels_aligned = regime_labels.loc[common_idx]
+        valid_regime_mask = regime_labels_aligned.notna()
+        weights_by_family_aligned = weights_by_family_aligned.loc[valid_regime_mask]
+        regime_labels_aligned = regime_labels_aligned.loc[valid_regime_mask]
+
+        if len(regime_labels_aligned) == 0:
+            return BenchmarkConditionalAnalysis(
+                family_weights_by_regime={},
+                family_overweight_by_regime={},
+                selection_probability=pd.DataFrame(),
+                family_returns_by_regime={},
+                contribution_by_regime={},
+                selection_model=None,
+                selection_features_importance={},
+            )
 
         # Pesos promedio por familia y regimen
         family_weights_by_regime = {}
@@ -1977,7 +2019,7 @@ class LatentRegimeInference:
             if family_cols:
                 returns_by_family[family_id] = algo_returns[family_cols].mean(axis=1)
 
-        return returns_by_family.fillna(0).astype(float)
+        return returns_by_family.astype(float)
 
     def _compute_selection_probability(
         self,
@@ -1990,7 +2032,7 @@ class LatentRegimeInference:
 
         Una familia se considera "seleccionada" si peso > threshold.
         """
-        regimes = sorted(regime_labels.unique())
+        regimes = sorted(regime_labels.dropna().unique())
         families = weights_by_family.columns
 
         prob_df = pd.DataFrame(index=regimes, columns=families, dtype=float)
@@ -2414,8 +2456,13 @@ class InvestmentClockRegimeInference:
 
         for i in range(window, len(returns)):
             window_data = returns.iloc[i-window:i].dropna(axis=1, how='all')
+            # Filter out constant columns (zero variance) to avoid correlation warnings
+            non_const_cols = window_data.std() > 1e-10
+            window_data = window_data.loc[:, non_const_cols]
             if window_data.shape[1] >= 2:
-                corr_matrix = window_data.corr()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    corr_matrix = window_data.corr()
                 # Mean of upper triangle
                 mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
                 mean_corr = corr_matrix.values[mask].mean()

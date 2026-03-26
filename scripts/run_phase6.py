@@ -723,7 +723,10 @@ class Phase6Runner(PhaseRunner):
             )
 
             # Compute weights using training data
-            weights = allocator.compute_weights(train_data)
+            n_algos = train_data.shape[1]
+            current_weights = np.zeros(n_algos)  # Start with no position
+            calc_date = fold['train_end']
+            weights = allocator.compute_weights(calc_date, train_data, current_weights)
 
             # Apply to test period
             test_returns = (test_data * weights).sum(axis=1)

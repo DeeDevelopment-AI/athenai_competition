@@ -119,7 +119,7 @@ class TestEncoderPickleRoundTrip:
                 loaded_enc = pickle.load(f)
 
         rng = np.random.default_rng(1)
-        raw_obs = rng.standard_normal(returns_200x10.shape[1] * 4 + 3).astype(np.float32)
+        raw_obs = rng.standard_normal(returns_200x10.shape[1] * 4 + 4).astype(np.float32)
         date = returns_200x10.index[150]
 
         orig = fitted_encoder.encode_obs(raw_obs, date)
@@ -261,7 +261,7 @@ class TestCorrectSaveLoadCycle:
             with open(tmp / "universe_encoder.pkl", "rb") as f:
                 loaded_enc = pickle.load(f)
 
-            # Obs dim: n_pca*4 + 3 = 4*4+3 = 19
+            # Obs dim: n_pca*4 + 4 = 4*4+4 = 20
             vec_env_eval = _make_vec_env(returns_200x10, train_end, encoder=loaded_enc)
             assert vec_env_eval.observation_space.shape == (loaded_enc.obs_dim,)
             assert vec_env_eval.action_space.shape == (loaded_enc.action_dim,)

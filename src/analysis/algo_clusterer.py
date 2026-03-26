@@ -1699,7 +1699,7 @@ class TemporalAlgoClusterer:
     def __init__(
         self,
         returns_matrix: pd.DataFrame,
-        start_date: str = '2020-01-01',
+        start_date: Optional[str] = None,
         n_clusters: int = 5,
         method: ClusterMethod = ClusterMethod.KMEANS,
         scaler_type: ScalerType = ScalerType.ROBUST,
@@ -1719,7 +1719,10 @@ class TemporalAlgoClusterer:
             random_state: Random seed for reproducibility
         """
         self.returns_matrix = returns_matrix.copy()
-        self.start_date = pd.Timestamp(start_date)
+        if start_date is None:
+            self.start_date = pd.Timestamp(self.returns_matrix.index.min())
+        else:
+            self.start_date = pd.Timestamp(start_date)
         self.n_clusters = n_clusters
         self.method = method
         self.scaler_type = scaler_type
@@ -1896,8 +1899,8 @@ class TemporalAlgoClusterer:
 
         # Vectorized total return: (1 + r).prod() - 1
         # Use nanprod equivalent
-        log_returns = np.log1p(period_returns.fillna(0))
-        total_return = np.exp(log_returns.sum()) - 1
+        log_returns = np.log1p(period_returns)
+        total_return = np.exp(log_returns.sum(skipna=True)) - 1
         features['return'] = total_return
 
         # Vectorized volatility (annualized)
@@ -1913,11 +1916,11 @@ class TemporalAlgoClusterer:
             )
 
         # Max drawdown (vectorized using cummax)
-        equity = (1 + period_returns.fillna(0)).cumprod()
+        equity = (1 + period_returns).cumprod()
         running_max = equity.cummax()
         with np.errstate(divide='ignore', invalid='ignore'):
             drawdown = (equity - running_max) / running_max
-        features['max_drawdown'] = drawdown.min()
+        features['max_drawdown'] = drawdown.min(skipna=True)
 
         # Calmar ratio (vectorized)
         with np.errstate(divide='ignore', invalid='ignore'):

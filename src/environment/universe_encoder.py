@@ -13,7 +13,7 @@ Stage 2 — Dynamic alive mask:
 Stage 3 — Walk-forward PCA:
     Project each per-algo feature vector (weights, ret5d, ret21d, vol) onto the
     principal components of the training-window return matrix.
-    Fit on training window only. obs: 9,616*4+3 → n_pca*4+3; action: 9,616 → n_pca.
+    Fit on training window only. obs: 9,616*4+4 → n_pca*4+4; action: 9,616 → n_pca.
 
 Look-ahead safeguards:
   - Stage 1: counts only within [train_start, train_end].
@@ -189,9 +189,9 @@ class AlgoUniverseEncoder:
 
     @property
     def obs_dim(self) -> int:
-        """Encoded observation dimension = n_pca*4 + 3."""
+        """Encoded observation dimension = n_pca*4 + 4 (4 scalars)."""
         self._check_fitted()
-        return self._n_components_actual * 4 + 3
+        return self._n_components_actual * 4 + 4
 
     @property
     def action_dim(self) -> int:
@@ -269,7 +269,7 @@ class AlgoUniverseEncoder:
         ret5d   = raw_obs[n : 2 * n]
         ret21d  = raw_obs[2 * n : 3 * n]
         vol     = raw_obs[3 * n : 4 * n]
-        scalars = raw_obs[4 * n :]  # (3,): avg_corr, drawdown, excess_return
+        scalars = raw_obs[4 * n :]  # (4,): avg_corr, drawdown, momentum_breadth, vol_regime
 
         # Stage 1: extract static algos
         w_s   = weights[self._static_indices]
@@ -353,12 +353,12 @@ class AlgoUniverseEncoder:
             "pca_explained_variance": round(
                 float(self._pca.explained_variance_ratio_.sum()), 4
             ),
-            "obs_dim_raw": self._n_total_algos * 4 + 3,
+            "obs_dim_raw": self._n_total_algos * 4 + 4,
             "obs_dim_encoded": self.obs_dim,
             "action_dim_raw": self._n_total_algos,
             "action_dim_encoded": self.action_dim,
             "compression_ratio_obs": round(
-                (self._n_total_algos * 4 + 3) / max(self.obs_dim, 1), 1
+                (self._n_total_algos * 4 + 4) / max(self.obs_dim, 1), 1
             ),
         }
 
@@ -486,9 +486,9 @@ class FamilyEncoder:
 
     @property
     def obs_dim(self) -> int:
-        """Encoded observation dimension = n_families * 5 + 3."""
+        """Encoded observation dimension = n_families * 5 + 4 (4 scalars)."""
         self._check_fitted()
-        return self._n_families * 5 + 3
+        return self._n_families * 5 + 4
 
     @property
     def action_dim(self) -> int:
@@ -541,12 +541,12 @@ class FamilyEncoder:
         """
         Aggregate raw MarketSimulator obs to family-level features.
 
-        raw_obs layout: [weights(n), ret5d(n), ret21d(n), vol(n), avg_corr, drawdown, excess]
-        where n = n_total_algos.
+        raw_obs layout: [weights(n), ret5d(n), ret21d(n), vol(n), avg_corr, drawdown, momentum_breadth, vol_regime]
+        where n = n_total_algos (4 scalars at end).
 
-        Returns (n_families * 5 + 3,):
+        Returns (n_families * 5 + 4,):
             For each family: [avg_ret5d, avg_ret21d, avg_vol, avg_weight, frac_active]
-            Then scalars: [avg_corr, drawdown, excess_return]
+            Then scalars: [avg_corr, drawdown, momentum_breadth, vol_regime]
         """
         self._check_fitted()
         n = self._n_total_algos
