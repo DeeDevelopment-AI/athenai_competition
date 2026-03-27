@@ -1,10 +1,72 @@
 #!/usr/bin/env python3
 """
+=================================================================
+PHASE 7A Tuning: ACO Factor Search
+=================================================================
 Tune Phase 7A ACO configurations with a Phase-3-style factor search.
 
 This script evaluates multiple selection factors against the ACO allocator,
 using temporal validation/test splits and ranking trials by out-of-sample
 performance.
+
+Usage:
+  python scripts/tune_phase7_aco.py
+  python scripts/tune_phase7_aco.py --quick --sample 100
+  python scripts/tune_phase7_aco.py --factor sharpe_21d momentum_63d
+  python scripts/tune_phase7_aco.py --selection-scheme walk_forward --max-folds 3
+
+Options:
+  --sample N                    Use only N algorithms (for faster testing)
+  --quick                       Run reduced factor search (fewer parameter combos)
+  --max-trials N                Maximum number of factor trials; 0 = all (default: 24)
+  --factor ALIAS [ALIAS ...]    Specific factor aliases to search (default: all)
+  --min-combination-size N      Minimum factors per combination (default: 1)
+  --max-combination-size N      Maximum factors per combination (default: all)
+  --input-dir PATH              Override Phase 1 processed directory
+  --analysis-dir PATH           Override Phase 2 analysis directory
+  --start-date YYYY-MM-DD       Start date for evaluation
+  --end-date YYYY-MM-DD         End date for evaluation
+
+Selection Scheme Options:
+  --selection-scheme S          How to score factors: walk_forward, single_split
+                                (default: walk_forward)
+
+Single-Split Options (when --selection-scheme single_split):
+  --train-ratio F               Train ratio for split (default: 0.60)
+  --validation-ratio F          Validation ratio for split (default: 0.20)
+
+Walk-Forward Options (when --selection-scheme walk_forward):
+  --train-window N              Training window in days (default: 252)
+  --validation-window N         Validation window in days (default: 63)
+  --test-window N               Test window in days (default: 63)
+  --step-size N                 Step size between folds (default: 63)
+  --expanding                   Use expanding window instead of rolling
+  --max-folds N                 Maximum number of folds
+
+Selection Criteria:
+  --selection-objective S       How to choose best trial (default: validation_excess_return)
+                                Options: validation_sharpe, validation_excess_return,
+                                         blended_excess_return, blended_sharpe
+  --validation-weight F         Weight on validation metrics (default: 0.70)
+  --test-weight F               Weight on test metrics (default: 0.30)
+  --max-validation-drawdown F   Max allowed validation drawdown (default: 0.12)
+  --max-test-drawdown F         Max allowed test drawdown (default: 0.15)
+  --allow-test-in-selection     Allow blended objectives that use test data in selection
+
+Available Factors:
+  momentum_21d, momentum_63d    Rolling return (21d, 63d windows)
+  sharpe_21d, sharpe_63d        Rolling Sharpe ratio
+  profit_factor_21d/63d         Rolling profit factor
+  calmar_21d, calmar_63d        Rolling Calmar ratio
+  drawdown_21d, drawdown_63d    Rolling drawdown
+  volatility_21d, volatility_63d  Rolling volatility
+
+Output Files:
+  tuning/factor_search/trials.csv               All trial results
+  tuning/factor_search/trial_split_metrics.csv  Per-split metrics
+  tuning/factor_search/relationship_summary.csv Validation-test relationships
+  tuning/factor_search/best_config.json         Best configuration
+  tuning/factor_search/SUMMARY.md               Human-readable report
 """
 
 from __future__ import annotations

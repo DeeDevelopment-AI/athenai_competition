@@ -17,16 +17,31 @@ Walk-Forward Protocol:
   - Step size: 63 days (rolling quarterly)
 
 Usage:
-  python scripts/run_phase6.py                      # Evaluate PPO (default)
+  python scripts/run_phase6.py                      # Evaluate PPO from latest run
   python scripts/run_phase6.py --agent all          # Evaluate all trained agents
   python scripts/run_phase6.py --quick              # Quick test (shorter windows)
   python scripts/run_phase6.py --include-baselines  # Include baseline comparison
   python scripts/run_phase6.py --folds 3            # Limit number of folds
+  python scripts/run_phase6.py --run-id 20260323_143000_ppo  # Specific training run
+  python scripts/run_phase6.py --list-runs          # List all available runs
 
 Options:
   --agent NAME           Agent to evaluate: ppo, sac, td3, all (default: ppo)
-  --quick                Quick test mode (shorter windows)
+  --quick                Quick test mode (shorter windows, smaller sample)
   --include-baselines    Also evaluate classical baselines
+  --sample N             Use only N algorithms (must match training)
+  --seed N               Random seed (default: 42)
+
+Model Selection:
+  --list-runs            List all available training runs with parameters and exit
+  --run-id ID            Evaluate models from a specific training run
+                         Default: reads outputs/rl_training/latest_run.txt
+                         Example: --run-id 20260323_143000_ppo
+  --models-dir PATH      Explicit path to directory containing trained models
+                         Takes priority over --run-id
+                         Example: --models-dir outputs/rl_training/20260323_143000/checkpoints
+
+Walk-Forward Configuration:
   --folds N              Maximum number of folds (default: all)
   --train-window N       Training window in days (default: 252)
   --val-window N         Validation window in days (default: 63)

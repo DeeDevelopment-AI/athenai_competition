@@ -22,20 +22,44 @@ Usage:
   python scripts/run_phase5.py --agent all      # Train all agents
   python scripts/run_phase5.py --timesteps 1M   # 1 million timesteps
   python scripts/run_phase5.py --sample 50      # Use 50 algorithms
+  python scripts/run_phase5.py --run-id exp01   # Custom run identifier
 
 Options:
   --agent NAME         Agent to train: ppo, sac, td3, all (default: ppo)
   --quick              Quick test mode (10k steps, 20 algos)
-  --timesteps N        Total training timesteps (default: 500k)
+  --timesteps N        Total training timesteps (default: 500K, supports K/M suffix)
   --sample N           Use only N algorithms
   --eval-freq N        Evaluation frequency in timesteps (default: 10k)
   --n-eval-episodes N  Episodes per evaluation (default: 5)
-  --rebalance-freq F   Rebalance frequency (default: weekly)
+  --rebalance-freq F   Rebalance frequency: daily, weekly, monthly (default: weekly)
   --seed N             Random seed (default: 42)
-  --max-resources      Auto-configure to fully use GPU/CPU/RAM (detects VRAM and sets
-                       n_envs, batch_size, net_arch, SubprocVecEnv automatically)
+  --learning-rate F    Learning rate (default: 1e-4)
+  --input-dir PATH     Override input directory (Phase 1 outputs)
+  --resume PATH        Path to checkpoint to resume training from
+
+Run Management:
+  --run-id ID          Identifier for this training run (default: auto YYYYMMDD_HHMMSS)
+                       Outputs go to outputs/rl_training/{run_id}/
+                       Use same ID with run_phase6.py --run-id to evaluate
+
+Parallelization:
+  --max-resources      Auto-configure to fully use GPU/CPU/RAM
+                       Detects VRAM to set n_envs, batch_size, net_arch automatically
   --n-envs N           Override number of parallel envs (default: 4)
   --use-subproc        Use SubprocVecEnv for true process parallelism
+  --gpu-env            Use GPU-accelerated batched environment (requires CUDA)
+
+Encoder Options:
+  --no-encoder         Disable AlgoUniverseEncoder (use raw 13k-dim obs/action spaces)
+  --pca-encoder        Use PCA-based encoder instead of FamilyEncoder (default: FamilyEncoder)
+  --pca-components N   Number of PCA components for encoder (default: 50)
+  --min-days-active N  Min active days for Stage 1 filter (default: 21)
+
+Hybrid Mode (MPT base + RL tilts):
+  --no-hybrid          Disable hybrid mode (use absolute weights instead)
+  --base-allocator S   Base allocator: risk_parity, equal_weight, min_variance
+                       (default: risk_parity)
+  --max-tilt F         Maximum tilt per asset in hybrid mode (default: 0.15 = ±15%)
 """
 
 import argparse

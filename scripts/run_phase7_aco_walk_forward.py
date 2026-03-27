@@ -1,6 +1,46 @@
 #!/usr/bin/env python3
 """
-Walk-forward evaluation for the best Phase 7A ACO configuration.
+=================================================================
+PHASE 7A Walk-Forward: ACO Walk-Forward Evaluation
+=================================================================
+Run walk-forward evaluation using the best Phase 7A ACO configuration
+found by tune_phase7_aco.py.
+
+This script loads the best configuration from the tuning output and
+evaluates it across multiple temporal folds for robust out-of-sample
+performance estimation.
+
+Usage:
+  python scripts/run_phase7_aco_walk_forward.py
+  python scripts/run_phase7_aco_walk_forward.py --config-path path/to/best_config.json
+  python scripts/run_phase7_aco_walk_forward.py --max-folds 5 --expanding
+  python scripts/run_phase7_aco_walk_forward.py --train-window 252 --test-window 63
+
+Options:
+  --config-path PATH            Path to best_config.json from factor search
+                                (default: auto-discover from tuning outputs)
+  --sample N                    Use only N algorithms (for faster testing)
+  --input-dir PATH              Override Phase 1 processed directory
+  --analysis-dir PATH           Override Phase 2 analysis directory
+  --start-date YYYY-MM-DD       Start date for evaluation window
+  --end-date YYYY-MM-DD         End date for evaluation window
+
+Walk-Forward Configuration:
+  --train-window N              Training window in days (default: 252)
+  --validation-window N         Validation window in days (default: 63)
+  --test-window N               Test window in days (default: 63)
+  --step-size N                 Step size between folds in days (default: 63)
+  --expanding                   Use expanding window instead of rolling
+  --max-folds N                 Maximum number of folds to evaluate
+
+Output Files:
+  walk_forward/folds.csv                 Per-fold metrics
+  walk_forward/portfolio_test_returns.csv  Stitched test returns
+  walk_forward/benchmark_test_returns.csv  Stitched benchmark returns
+  walk_forward/summary.json              Summary statistics
+  walk_forward/comparison.json           Benchmark comparison
+  walk_forward/comparison.csv            Comparison table
+  walk_forward/SUMMARY.md                Human-readable report
 """
 
 from __future__ import annotations

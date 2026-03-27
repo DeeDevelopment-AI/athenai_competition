@@ -14,16 +14,30 @@ Usage:
   python scripts/run_phase2.py
   python scripts/run_phase2.py --sample 100 --skip-inference
   python scripts/run_phase2.py --n-regimes 6 --n-families 10
+  python scripts/run_phase2.py --family-clustering-method gmm --family-refinement-strategy self_training
 
 Options:
-  --sample N               Use only N algorithms (for testing)
-  --n-regimes N            Number of latent regimes (default: 4)
-  --n-families N           Number of algorithm families (default: 8)
-  --n-clusters N           Number of temporal clusters (default: 5)
-  --skip-inference         Skip latent regime inference (faster)
-  --skip-correlations      Skip correlation analysis (faster)
-  --skip-temporal          Skip temporal clustering analysis (faster)
-  --clustering-method M    Clustering method: kmeans, gmm, hierarchical (default: kmeans)
+  --sample N                       Use only N algorithms (for testing)
+  --n-regimes N                    Number of latent regimes (default: 4)
+  --n-families N                   Number of algorithm families (default: 8)
+  --n-clusters N                   Number of temporal clusters (default: 5)
+  --skip-inference                 Skip latent regime inference (faster)
+  --skip-correlations              Skip correlation analysis (faster)
+  --skip-temporal                  Skip temporal clustering analysis (faster)
+  --input-dir PATH                 Override input directory (Phase 1 outputs)
+
+Family Clustering Options:
+  --family-clustering-method M     Base clustering method for family pseudo-labels
+                                   Options: kmeans, gmm, hierarchical, dbscan, hdbscan (default: gmm)
+  --family-refinement-strategy S   XGBoost refinement strategy for family labels
+                                   Options: none, direct, self_training, confidence_refinement, anomaly
+                                   (default: direct)
+  --family-confidence-threshold F  Confidence threshold for confidence-based refinement (default: 0.8)
+  --family-refinement-max-iter N   Max refinement iterations for pseudo-labeling (default: 5)
+
+Temporal Clustering Options:
+  --clustering-method M            Temporal clustering method
+                                   Options: kmeans, gmm, hierarchical, dbscan, hdbscan (default: kmeans)
 """
 
 import argparse

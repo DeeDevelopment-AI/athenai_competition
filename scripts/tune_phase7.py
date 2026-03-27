@@ -1,6 +1,46 @@
 #!/usr/bin/env python3
 """
-Tune Phase 7 swarm hyperparameters using temporal validation.
+=================================================================
+PHASE 7 Tuning: Hyperparameter Optimization
+=================================================================
+Tune Phase 7 swarm (PSO) hyperparameters using temporal validation.
+
+This script evaluates multiple pre-defined configuration candidates
+against temporal validation/test splits and ranks them by out-of-sample
+performance.
+
+Usage:
+  python scripts/tune_phase7.py
+  python scripts/tune_phase7.py --max-trials 4 --sample 100
+  python scripts/tune_phase7.py --selection-objective blended_sharpe
+  python scripts/tune_phase7.py --cpu-only --start-date 2021-01-01
+
+Options:
+  --sample N                    Use only N algorithms (for faster testing)
+  --max-trials N                Maximum candidate configurations to evaluate (default: 8)
+  --cpu-only                    Disable GPU usage
+  --input-dir PATH              Override Phase 1 processed directory
+  --analysis-dir PATH           Override Phase 2 analysis directory
+  --start-date YYYY-MM-DD       Start date for evaluation
+  --end-date YYYY-MM-DD         End date for evaluation
+
+Temporal Split Options:
+  --train-ratio F               Train ratio for temporal split (default: 0.60)
+  --validation-ratio F          Validation ratio for temporal split (default: 0.20)
+
+Selection Criteria:
+  --selection-objective S       How to choose best trial (default: blended_excess_return)
+                                Options: validation_excess_return, validation_sharpe,
+                                         blended_excess_return, blended_sharpe
+  --validation-weight F         Weight on validation metrics (default: 0.70)
+  --test-weight F               Weight on test metrics (default: 0.30)
+  --max-validation-drawdown F   Max allowed validation drawdown (default: 0.10)
+  --max-test-drawdown F         Max allowed test drawdown (default: 0.12)
+
+Output Files:
+  tuning/trials.csv             All trial results
+  tuning/best_config.json       Best configuration
+  tuning/SUMMARY.md             Human-readable report
 """
 
 from __future__ import annotations

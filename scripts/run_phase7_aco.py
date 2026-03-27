@@ -13,6 +13,61 @@ Usage:
   python scripts/run_phase7_aco.py
   python scripts/run_phase7_aco.py --sample 100 --top-k 32 --ants 64
   python scripts/run_phase7_aco.py --start-date 2021-01-01 --end-date 2023-12-31
+  python scripts/run_phase7_aco.py --selection-factor rolling_sharpe_21d rolling_return_63d
+
+Options:
+  --sample N                    Use only N algorithms (for faster testing)
+  --top-k N                     Candidate pool size passed to optimizer (default: 256)
+  --lookback-window N           Lookback window in days (default: 126)
+  --min-history N               Minimum history required in days (default: 63)
+  --rebalance-freq F            Rebalance frequency: daily, weekly, monthly (default: weekly)
+  --selection-factor S [S ...]  Feature(s) for candidate selection (default: rolling_sharpe_21d)
+  --start-date YYYY-MM-DD       Start date for backtest
+  --end-date YYYY-MM-DD         End date for backtest
+
+ACO Parameters:
+  --ants N                      Number of ants per iteration (default: 96)
+  --iterations N                Number of ACO iterations (default: 60)
+  --weight-buckets N            Discrete weight buckets per algorithm (default: 21)
+  --pheromone-power F           Alpha exponent on pheromone (default: 1.0)
+  --heuristic-power F           Beta exponent on heuristic desirability (default: 2.0)
+  --evaporation-rate F          Pheromone evaporation rate (default: 0.30)
+  --pheromone-deposit-scale F   Base pheromone deposit scale (default: 1.0)
+  --elite-ants N                Top ants for pheromone reinforcement (default: 8)
+
+Constraint Options:
+  --max-weight F                Max weight per algorithm (default: 0.40)
+  --max-family-exposure F       Max family exposure (default: 0.30)
+  --min-active-weight F         Min weight to count as active (default: 0.0025)
+  --min-gross-exposure F        Min total portfolio exposure (default: 0.85)
+  --target-portfolio-vol F      Target annualized volatility (default: 0.16)
+
+Objective Weight Options:
+  --expected-return-weight F    Weight on expected return (default: 0.80)
+  --volatility-weight F         Weight on volatility penalty (default: 0.35)
+  --turnover-weight F           Weight on turnover penalty (default: 0.15)
+  --concentration-weight F      Weight on concentration penalty (default: 0.10)
+  --diversification-weight F    Weight on diversification reward (default: 0.12)
+  --family-penalty-weight F     Weight on family concentration (default: 0.20)
+  --family-alpha-reward-weight F  Weight on family alpha reward (default: 0.15)
+  --risk-budget-weight F        Weight on risk budget deviation (default: 0.25)
+  --sparsity-penalty-weight F   Weight on sparsity penalty (default: 0.01)
+  --entropy-reward-weight F     Weight on entropy reward (default: 0.05)
+  --sharpe-weight F             Weight on Sharpe ratio in objective (default: 1.75)
+  --under-investment-penalty-weight F  Penalty for under-investment (default: 0.35)
+  --regime-focus F              Regime focus multiplier (default: 1.50)
+
+Advanced Options:
+  --objective-name S            Name of the objective function (default: aco_sharpe_balanced)
+  --selection-mode S            Universe selection: legacy, benchmark_aware (default: legacy)
+  --normalize-objective-metrics Normalize objective components cross-sectionally
+  --temporal-split S            Temporal eval split: none, auto (default: auto)
+  --train-ratio F               Train ratio for temporal split (default: 0.60)
+  --validation-ratio F          Validation ratio for temporal split (default: 0.20)
+  --seed N                      Random seed (default: 42)
+  --cpu-only                    Compatibility flag (ACO runs on CPU)
+  --input-dir PATH              Override Phase 1 processed directory
+  --analysis-dir PATH           Override Phase 2 analysis directory
 """
 
 import argparse

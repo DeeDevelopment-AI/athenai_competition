@@ -13,6 +13,54 @@ Usage:
   python scripts/run_phase7.py
   python scripts/run_phase7.py --sample 100 --top-k 32 --particles 64
   python scripts/run_phase7.py --start-date 2021-01-01 --end-date 2023-12-31
+  python scripts/run_phase7.py --cpu-only --rebalance-freq monthly
+
+Options:
+  --sample N                    Use only N algorithms (for faster testing)
+  --top-k N                     Candidate pool size passed to the optimizer (default: 256)
+  --lookback-window N           Lookback window in days (default: 126)
+  --min-history N               Minimum history required in days (default: 63)
+  --particles N                 Number of PSO swarm particles (default: 128)
+  --iterations N                Number of PSO iterations (default: 80)
+  --inertia F                   PSO inertia term (default: 0.70)
+  --cognitive-weight F          PSO cognitive coefficient (default: 1.40)
+  --social-weight F             PSO social coefficient (default: 1.30)
+  --rebalance-freq F            Rebalance frequency: daily, weekly, monthly (default: weekly)
+  --selection-factor S          Feature for candidate selection (default: rolling_sharpe_21d)
+  --start-date YYYY-MM-DD       Start date for backtest
+  --end-date YYYY-MM-DD         End date for backtest
+
+Constraint Options:
+  --max-weight F                Max weight per algorithm (default: 0.40)
+  --max-family-exposure F       Max family exposure (default: 0.30)
+  --min-active-weight F         Min weight to count as active (default: 0.0025)
+  --min-gross-exposure F        Min total portfolio exposure (default: 0.85)
+  --target-portfolio-vol F      Target annualized volatility (default: 0.16)
+
+Objective Weight Options:
+  --expected-return-weight F    Weight on expected return in objective (default: 1.00)
+  --volatility-weight F         Weight on volatility penalty (default: 0.50)
+  --tracking-error-weight F     Weight on tracking error penalty (default: 0.35)
+  --turnover-weight F           Weight on turnover penalty (default: 0.15)
+  --concentration-weight F      Weight on concentration penalty (default: 0.10)
+  --diversification-weight F    Weight on diversification reward (default: 0.10)
+  --family-penalty-weight F     Weight on family concentration penalty (default: 0.20)
+  --risk-budget-weight F        Weight on risk budget deviation (default: 0.30)
+  --sparsity-penalty-weight F   Weight on sparsity penalty (default: 0.01)
+  --under-investment-penalty-weight F  Penalty for under-investment (default: 0.35)
+  --regime-focus F              Regime focus multiplier (default: 1.50)
+
+Advanced Options:
+  --objective-name S            Name of the objective function (default: alpha_risk_balanced)
+  --selection-mode S            Universe selection: legacy, benchmark_aware (default: legacy)
+  --normalize-objective-metrics Normalize objective components cross-sectionally
+  --temporal-split S            Temporal eval split: none, auto (default: auto)
+  --train-ratio F               Train ratio for temporal split (default: 0.60)
+  --validation-ratio F          Validation ratio for temporal split (default: 0.20)
+  --seed N                      Random seed (default: 42)
+  --cpu-only                    Disable GPU usage
+  --input-dir PATH              Override Phase 1 processed directory
+  --analysis-dir PATH           Override Phase 2 analysis directory
 """
 
 import argparse
