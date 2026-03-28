@@ -22,8 +22,11 @@ import json
 import os
 import sys
 import argparse
+from pathlib import Path
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
-from notebook_paths import NOTEBOOK_DATA_DIR
+from notebook_paths import NOTEBOOK_DATA_DIR, PROJECT_ROOT
 
 # ============================================================
 # CONFIG
@@ -171,6 +174,315 @@ def safe_load_json(filename):
     return None
 
 
+def resolve_latest_phase2_analysis_root() -> tuple[Path, str]:
+    analysis_outputs = PROJECT_ROOT / "outputs" / "analysis"
+    processed_analysis = PROJECT_ROOT / "data" / "processed" / "analysis"
+    latest_txt = analysis_outputs / "latest_run.txt"
+    if latest_txt.exists():
+        run_id = latest_txt.read_text(encoding="utf-8").strip()
+        run_dir = analysis_outputs / run_id
+        snapshot_dir = run_dir / "analysis_snapshot"
+        if snapshot_dir.exists():
+            return snapshot_dir, f"outputs/analysis/{run_id}/analysis_snapshot"
+        if (run_dir / "clustering").exists():
+            return run_dir, f"outputs/analysis/{run_id}"
+    return processed_analysis, "data/processed/analysis"
+
+
+@st.cache_data
+def load_phase2_cluster_dashboard_data():
+    analysis_root, source_label = resolve_latest_phase2_analysis_root()
+
+    behavioral_path = analysis_root / "clustering" / "behavioral" / "features.csv"
+    family_labels_path = analysis_root / "clustering" / "behavioral" / "family_labels.csv"
+    family_conf_path = analysis_root / "clustering" / "behavioral" / "family_confidence.csv"
+    cluster_history_path = analysis_root / "clustering" / "temporal" / "cluster_history.csv"
+    cluster_stability_path = analysis_root / "clustering" / "temporal" / "cluster_stability.csv"
+
+    required = [
+        behavioral_path,
+        family_labels_path,
+        family_conf_path,
+        cluster_history_path,
+        cluster_stability_path,
+    ]
+    missing = [str(p) for p in required if not p.exists()]
+    if missing:
+        return {
+            "source_label": source_label,
+            "error": f"Missing Phase 2 clustering artifacts: {missing}",
+        }
+
+    behavioral = pd.read_csv(behavioral_path).rename(columns={"Unnamed: 0": "algo_id"})
+    family_labels = pd.read_csv(family_labels_path).rename(columns={"Unnamed: 0": "algo_id"})
+    family_conf = pd.read_csv(family_conf_path).rename(columns={"Unnamed: 0": "algo_id"})
+    cluster_history = pd.read_csv(cluster_history_path)
+    cluster_stability = pd.read_csv(cluster_stability_path)
+
+    base_df = (
+        behavioral
+        .merge(family_labels[["algo_id", "family"]], on="algo_id", how="left")
+        .merge(family_conf[["algo_id", "confidence"]], on="algo_id", how="left")
+    )
+
+    cluster_history["week_end"] = pd.to_datetime(cluster_history["week_end"], errors="coerce")
+    latest_week = cluster_history["week_end"].max()
+    latest_temporal = cluster_history[cluster_history["week_end"] == latest_week].copy()
+    latest_temporal["cluster_cumulative"] = latest_temporal["cluster_cumulative"].astype(str)
+
+    cluster_df = base_df.merge(
+        latest_temporal[["algo_id", "cluster_cumulative"]],
+        on="algo_id",
+        how="inner",
+    )
+    display_df = cluster_df[cluster_df["cluster_cumulative"] != "inactive"].copy()
+
+    pca_features = [
+        "ann_return", "ann_vol", "sharpe", "sortino", "max_dd",
+        "skewness", "kurtosis", "tail_ratio", "beta_universe",
+        "beta_drawdowns", "sharpe_stability", "return_stability",
+    ]
+    pca_features = [c for c in pca_features if c in display_df.columns]
+    pca_frame = display_df[["algo_id", "cluster_cumulative", "confidence"] + pca_features].dropna(subset=pca_features).copy()
+    if not pca_frame.empty:
+        X_scaled = StandardScaler().fit_transform(pca_frame[pca_features].to_numpy(dtype=float))
+        coords = PCA(n_components=2, random_state=42).fit_transform(X_scaled)
+        pca_frame["pca_x"] = coords[:, 0]
+        pca_frame["pca_y"] = coords[:, 1]
+    else:
+        pca_frame["pca_x"] = []
+        pca_frame["pca_y"] = []
+    pca_frame["cluster"] = pca_frame["cluster_cumulative"]
+    pca_frame["name"] = pca_frame["algo_id"]
+    pca_frame["cluster_str"] = pca_frame["cluster"].astype(str)
+
+    def cluster_label(row):
+        ret = float(row.get("ann_return_mean", 0.0))
+        vol = float(row.get("ann_vol_mean", 0.0))
+        sharpe = float(row.get("sharpe_mean", 0.0))
+        parts = []
+        if ret > 0.15:
+            parts.append("Alto retorno")
+        elif ret > 0.03:
+            parts.append("Retorno moderado")
+        elif ret > -0.03:
+            parts.append("Retorno neutro")
+        else:
+            parts.append("Retorno negativo")
+        if vol > 0.25:
+            parts.append("alta volatilidad")
+        elif vol > 0.12:
+            parts.append("volatilidad media")
+        else:
+            parts.append("baja volatilidad")
+        if sharpe > 1.0:
+            parts.append("(muy eficiente)")
+        elif sharpe > 0.3:
+            parts.append("(eficiente)")
+        elif sharpe < -0.5:
+            parts.append("(ineficiente)")
+        return " · ".join(parts)
+
+    profiles = display_df.groupby("cluster_cumulative").agg(
+        cluster=("cluster_cumulative", "first"),
+        n_algorithms=("algo_id", "count"),
+        pct_of_total=("algo_id", lambda s: 100.0 * len(s) / len(display_df)),
+        ann_return_mean=("ann_return", "mean"),
+        ann_vol_mean=("ann_vol", "mean"),
+        sharpe_mean=("sharpe", "mean"),
+        sortino_mean=("sortino", "mean"),
+        max_dd_mean=("max_dd", "mean"),
+        calmar_mean=("tail_ratio", "mean"),
+        win_rate_mean=("return_stability", "mean"),
+        skewness_mean=("skewness", "mean"),
+        confidence_mean=("confidence", "mean"),
+        dominant_family=("family", lambda s: s.mode().iloc[0] if not s.mode().empty else np.nan),
+    ).reset_index(drop=True)
+    profiles["cluster_numeric"] = pd.to_numeric(profiles["cluster"], errors="coerce")
+    profiles = profiles.sort_values(["cluster_numeric", "cluster"], na_position="last").drop(columns=["cluster_numeric"])
+    profiles["label"] = profiles.apply(cluster_label, axis=1)
+
+    radar_metrics = [
+        ("ann_return_mean", "Annualized Return"),
+        ("ann_vol_mean", "Annualized Volatility"),
+        ("sharpe_mean", "Sharpe Ratio"),
+        ("sortino_mean", "Sortino Ratio"),
+        ("max_dd_mean", "Max Drawdown"),
+        ("confidence_mean", "Confidence"),
+    ]
+    radar_norm = profiles.copy()
+    for metric, _ in radar_metrics:
+        series = radar_norm[metric].astype(float)
+        if metric == "max_dd_mean":
+            series = -series
+        mn, mx = series.min(), series.max()
+        radar_norm[metric] = 50.0 if mx <= mn else 100.0 * (series - mn) / (mx - mn)
+    radar = {
+        "labels": [label for _, label in radar_metrics],
+        "data": {
+            str(row["cluster"]): [float(row[m]) for m, _ in radar_metrics]
+            for _, row in radar_norm.iterrows()
+        },
+    }
+
+    return {
+        "source_label": source_label,
+        "clusters": pca_frame,
+        "profiles": profiles,
+        "radar": radar,
+        "latest_week": latest_week,
+        "temporal_summary": profiles.copy(),
+        "cluster_stability": cluster_stability,
+        "error": None,
+    }
+
+
+def list_run_dirs(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+@st.cache_data
+def load_json_path(path_str: str):
+    path = Path(path_str)
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+@st.cache_data
+def load_csv_path(path_str: str, **kwargs):
+    path = Path(path_str)
+    if path.exists():
+        return pd.read_csv(path, **kwargs)
+    return None
+
+
+def flatten_dict(d: dict, prefix: str = "") -> dict:
+    rows = {}
+    for key, value in d.items():
+        full_key = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            rows.update(flatten_dict(value, full_key))
+        elif isinstance(value, list):
+            rows[full_key] = ", ".join(map(str, value)) if value and not isinstance(value[0], dict) else json.dumps(value, ensure_ascii=False)
+        else:
+            rows[full_key] = value
+    return rows
+
+
+def render_key_value_table(title: str, payload: dict):
+    st.subheader(title)
+    if not payload:
+        st.info("No data available.")
+        return
+    flat = flatten_dict(payload)
+    df = pd.DataFrame({"parameter": list(flat.keys()), "value": list(flat.values())})
+    st.dataframe(df, width='stretch', hide_index=True)
+
+
+def resolve_phase5_run_dirs() -> list[Path]:
+    return list_run_dirs(PROJECT_ROOT / "outputs" / "rl_training")
+
+
+def resolve_phase6_run_dirs() -> list[Path]:
+    return list_run_dirs(PROJECT_ROOT / "outputs" / "evaluation")
+
+
+def load_phase5_run(run_dir: Path) -> dict:
+    training_metrics_path = None
+    logs_dir = run_dir / "logs"
+    if logs_dir.exists():
+        for candidate in logs_dir.glob("*/metrics.csv"):
+            training_metrics_path = candidate
+            break
+    return {
+        "run_info": load_json_path(str(run_dir / "run_info.json")),
+        "results": load_json_path(str(run_dir / "phase5_results.json")),
+        "metrics": load_json_path(str(run_dir / "phase5_metrics.json")),
+        "training_metrics": load_csv_path(str(training_metrics_path)) if training_metrics_path else None,
+        "cluster_ranking": load_csv_path(str(run_dir / "cluster_selection" / "cluster_ranking.csv")),
+        "selected_algos": load_csv_path(str(run_dir / "cluster_selection" / "selected_algos.csv")),
+    }
+
+
+def load_phase6_run(run_dir: Path) -> dict:
+    return {
+        "results": load_json_path(str(run_dir / "phase6_results.json")),
+        "metrics": load_json_path(str(run_dir / "phase6_metrics.json")),
+        "summary_md": (run_dir / "PHASE6_SUMMARY.md").read_text(encoding="utf-8") if (run_dir / "PHASE6_SUMMARY.md").exists() else None,
+        "equity_plot": run_dir / "phase6_equity_vs_benchmark.png",
+        "agent_folds": next(iter(sorted((run_dir / "walk_forward").glob("*_folds.csv"))), None) if (run_dir / "walk_forward").exists() else None,
+    }
+
+
+def build_phase6_comparison_df(results_payload: dict | None) -> pd.DataFrame | None:
+    if not results_payload:
+        return None
+    strategies = results_payload.get("comparison", {}).get("strategies", [])
+    if not strategies:
+        return None
+    df = pd.DataFrame(strategies)
+    if "volatility" in df.columns and "annualized_volatility" not in df.columns:
+        df["annualized_volatility"] = df["volatility"]
+    return df
+
+
+def infer_phase5_run_from_phase6(results_payload: dict | None) -> str | None:
+    if not results_payload:
+        return None
+    agents = results_payload.get("agents", {})
+    if not agents:
+        return None
+    agent_payload = next(iter(agents.values()))
+    model_path = agent_payload.get("model_path")
+    if not model_path:
+        return None
+    model_parts = Path(model_path).parts
+    if "rl_training" in model_parts:
+        idx = model_parts.index("rl_training")
+        if idx + 1 < len(model_parts):
+            return model_parts[idx + 1]
+    return None
+
+
+def render_phase6_equity_plot(run_dir: Path, results_payload: dict | None):
+    image_path = run_dir / "phase6_equity_vs_benchmark.png"
+    if image_path.exists():
+        st.image(str(image_path), caption="Equity agente vs benchmark", width='stretch')
+        return
+
+    if not results_payload:
+        st.info("No equity plot available.")
+        return
+
+    agents = results_payload.get("agents", {})
+    if not agents:
+        st.info("No equity plot available.")
+        return
+    agent_name, agent_payload = next(iter(agents.items()))
+    folds = pd.DataFrame(agent_payload.get("fold_results", []))
+    if folds.empty:
+        st.info("No equity plot available.")
+        return
+
+    folds["test_end"] = pd.to_datetime(folds["test_end"])
+    folds = folds.sort_values("test_end").copy()
+    folds["benchmark_return"] = folds["annualized_return"] - folds["excess_return"]
+    folds["agent_equity"] = (1.0 + folds["annualized_return"]).cumprod()
+    folds["benchmark_equity"] = (1.0 + folds["benchmark_return"]).cumprod()
+    plot_df = pd.DataFrame({
+        "date": list(folds["test_end"]) * 2,
+        "equity": list(folds["agent_equity"]) + list(folds["benchmark_equity"]),
+        "series": [agent_name.upper()] * len(folds) + ["Benchmark"] * len(folds),
+    })
+    fig = px.line(plot_df, x="date", y="equity", color="series", title="Equity por folds: agente vs benchmark")
+    fig.update_layout(height=420)
+    st.plotly_chart(fig, width='stretch')
+
+
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -184,6 +496,9 @@ with st.sidebar:
         "🔍 Algorithm Explorer",
         "🎯 Asset Inference",
         "🧩 Clustering",
+        "🤖 Phase 5",
+        "🧭 Phase 6",
+        "📋 Summary",
         "🔗 Algo Relationships",
         "📈 Benchmark Reconstruction",
         "📊 Benchmark Comparison",
@@ -453,60 +768,362 @@ elif page == "🎯 Asset Inference":
 
 elif page == "🧩 Clustering":
     st.header("Clustering Analysis")
+    phase2_data = load_phase2_cluster_dashboard_data()
 
-    clusters = safe_load('clusters.csv')
-    profiles = safe_load('cluster_profiles.csv')
-    cluster_json = safe_load_json('cluster_analysis.json')
+    if phase2_data.get("error"):
+        st.warning(phase2_data["error"])
+        st.info("Falling back to notebooks clustering artifacts if available.")
+        clusters = safe_load('clusters.csv')
+        profiles = safe_load('cluster_profiles.csv')
+        cluster_json = safe_load_json('cluster_analysis.json')
+    else:
+        st.caption(f"Source: `{phase2_data['source_label']}`")
+        clusters = phase2_data["clusters"]
+        profiles = phase2_data["profiles"]
+        cluster_json = {"radar": phase2_data["radar"]}
 
-    if clusters is None:
-        st.warning("No clusters.csv found. Run `algo_cluster.py` first.")
+    if clusters is None or profiles is None:
+        st.warning("No clustering data available.")
     else:
         n_clusters = clusters['cluster'].nunique()
         st.metric("Number of Clusters", n_clusters)
 
-        # PCA scatter
         if 'pca_x' in clusters.columns and 'pca_y' in clusters.columns:
             st.subheader("Cluster Map (PCA)")
-            clusters['cluster_str'] = clusters['cluster'].astype(str)
-            fig = px.scatter(clusters, x='pca_x', y='pca_y',
-                             color='cluster_str', hover_name='name',
-                             title="Algorithms in PCA Space (colored by cluster)",
-                             color_discrete_sequence=px.colors.qualitative.Set1)
+            fig = px.scatter(
+                clusters,
+                x='pca_x',
+                y='pca_y',
+                color='cluster_str' if 'cluster_str' in clusters.columns else clusters['cluster'].astype(str),
+                hover_name='name' if 'name' in clusters.columns else None,
+                title="Algorithms in PCA Space (colored by cluster)",
+                color_discrete_sequence=px.colors.qualitative.Set1,
+            )
             fig.update_layout(height=550)
             st.plotly_chart(fig, width='stretch')
 
-        # Cluster profiles
-        if profiles is not None:
-            st.subheader("Cluster Profiles")
+        st.subheader("Cluster Profiles")
+        preferred_metric_cols = [
+            'ann_return_mean',
+            'ann_vol_mean',
+            'sharpe_mean',
+            'sortino_mean',
+            'max_dd_mean',
+            'calmar_mean',
+            'win_rate_mean',
+            'skewness_mean',
+            'confidence_mean',
+        ]
+        metric_cols = [c for c in preferred_metric_cols if c in profiles.columns]
+        if not metric_cols:
+            metric_cols = [c for c in profiles.columns if c.endswith('_mean')]
 
-            metric_cols = [c for c in profiles.columns if c.endswith('_mean')
-                           and not c.startswith('SP500') and not c.startswith('Gold')
-                           and not c.startswith('EURUSD')]
+        if 'label' in profiles.columns:
+            for _, row in profiles.iterrows():
+                with st.expander(
+                    f"Cluster {int(row['cluster'])}: {row['label']} "
+                    f"({int(row['n_algorithms'])} algos, {row['pct_of_total']:.1f}%)"
+                ):
+                    cols = st.columns(4)
+                    for i, mc in enumerate(metric_cols[:8]):
+                        display_name = mc.replace('_mean', '').replace('_', ' ').title()
+                        value = row[mc]
+                        if any(token in mc for token in ['return', 'vol', 'drawdown', 'dd']):
+                            shown = f"{100 * value:.2f}%"
+                        else:
+                            shown = f"{value:.3f}"
+                        cols[i % 4].metric(display_name, shown)
 
-            if 'label' in profiles.columns:
-                for _, row in profiles.iterrows():
-                    with st.expander(f"Cluster {int(row['cluster'])}: {row['label']} "
-                                     f"({int(row['n_algorithms'])} algos, {row['pct_of_total']:.1f}%)"):
-                        cols = st.columns(4)
-                        for i, mc in enumerate(metric_cols[:8]):
-                            display_name = mc.replace('_mean', '').replace('_', ' ').title()
-                            cols[i % 4].metric(display_name, f"{row[mc]:.3f}")
+        if cluster_json and 'radar' in cluster_json:
+            st.subheader("Cluster Radar Comparison")
+            radar = cluster_json['radar']
+            fig = go.Figure()
+            for cid, values in radar.get('data', {}).items():
+                fig.add_trace(go.Scatterpolar(
+                    r=values + [values[0]],
+                    theta=radar['labels'] + [radar['labels'][0]],
+                    name=f"Cluster {cid}",
+                    fill='toself',
+                    opacity=0.3
+                ))
+            fig.update_layout(
+                polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                height=500
+            )
+            st.plotly_chart(fig, width='stretch')
 
-            # Radar chart
-            if cluster_json and 'radar' in cluster_json:
-                st.subheader("Cluster Radar Comparison")
-                radar = cluster_json['radar']
-                fig = go.Figure()
-                for cid, values in radar.get('data', {}).items():
-                    fig.add_trace(go.Scatterpolar(
-                        r=values + [values[0]],
-                        theta=radar['labels'] + [radar['labels'][0]],
-                        name=f"Cluster {cid}",
-                        fill='toself', opacity=0.3
-                    ))
-                fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
-                                  height=500)
+        if phase2_data.get("temporal_summary") is not None and not phase2_data["temporal_summary"].empty:
+            latest_week = phase2_data.get("latest_week")
+            st.subheader("Latest Temporal Cluster Summary")
+            if latest_week is not None and not pd.isna(latest_week):
+                st.caption(f"Latest cut: {pd.Timestamp(latest_week).date()}")
+            temporal_summary = phase2_data["temporal_summary"].copy()
+            st.dataframe(
+                temporal_summary.style.format({
+                    'ann_return_mean': '{:.2%}',
+                    'ann_vol_mean': '{:.2%}',
+                    'sharpe_mean': '{:.2f}',
+                    'sortino_mean': '{:.2f}',
+                }),
+                width='stretch',
+                hide_index=True,
+            )
+
+        if phase2_data.get("cluster_stability") is not None and not phase2_data["cluster_stability"].empty:
+            st.subheader("Cluster Stability Snapshot")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.caption("Most stable algorithms")
+                stable = phase2_data["cluster_stability"].sort_values("stability_ratio", ascending=False).head(10)
+                st.dataframe(stable, width='stretch', hide_index=True)
+            with col2:
+                st.caption("Least stable algorithms")
+                unstable = phase2_data["cluster_stability"].sort_values("stability_ratio", ascending=True).head(10)
+                st.dataframe(unstable, width='stretch', hide_index=True)
+
+
+# ============================================================
+# PAGE: PHASE 5
+# ============================================================
+
+elif page == "🤖 Phase 5":
+    st.header("Phase 5: RL Training")
+    phase5_runs = resolve_phase5_run_dirs()
+    if not phase5_runs:
+        st.warning("No Phase 5 runs found under outputs/rl_training.")
+    else:
+        run_names = [p.name for p in phase5_runs]
+        selected_name = st.selectbox("Select Phase 5 run", run_names, index=0)
+        selected_dir = next(p for p in phase5_runs if p.name == selected_name)
+        run_data = load_phase5_run(selected_dir)
+        run_info = run_data["run_info"] or {}
+        results = run_data["results"] or {}
+        metrics = run_data["metrics"] or {}
+
+        st.caption(f"Run directory: `{selected_dir}`")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Agent", results.get("config", {}).get("agent", run_info.get("agents", ["unknown"])[0] if run_info.get("agents") else "unknown"))
+        c2.metric("Timesteps", f"{results.get('config', {}).get('total_timesteps', run_info.get('total_timesteps', 0)):,}")
+        c3.metric("Universe Size", f"{results.get('n_algos', run_info.get('phase2_cluster_selection', {}).get('selected_algo_count', 0)):,}")
+        c4.metric("GPU", "Yes" if results.get("env", {}).get("gpu_accelerated") else "No")
+
+        cluster_selection = results.get("phase2_cluster_selection") or run_info.get("phase2_cluster_selection") or {}
+        if cluster_selection:
+            st.subheader("Phase 2 Cluster Selection")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Source", str(cluster_selection.get("source", "-")))
+            col2.metric("Top-K", str(cluster_selection.get("top_k", "-")))
+            col3.metric("Selected Clusters", ", ".join(map(str, cluster_selection.get("selected_clusters", []))) or "-")
+            col4.metric("Selected Algos", f"{cluster_selection.get('selected_algo_count', 0):,}")
+
+        training_rows = []
+        for item in results.get("agents_trained", []):
+            summary = item.get("training_summary", {})
+            training_rows.append(
+                {
+                    "agent": item.get("agent"),
+                    "timesteps": item.get("timesteps"),
+                    "mean_sharpe": summary.get("mean_sharpe"),
+                    "final_sharpe": summary.get("final_sharpe"),
+                    "mean_return": summary.get("mean_return"),
+                    "total_return": summary.get("total_return"),
+                    "worst_drawdown": summary.get("worst_drawdown"),
+                }
+            )
+        if training_rows:
+            st.subheader("Training Summary")
+            st.dataframe(pd.DataFrame(training_rows), width='stretch', hide_index=True)
+
+        training_metrics = run_data["training_metrics"]
+        if training_metrics is not None and not training_metrics.empty:
+            st.subheader("Training Curves")
+            numeric_cols = [c for c in training_metrics.columns if c != "step" and pd.api.types.is_numeric_dtype(training_metrics[c])]
+            y_col = None
+            for candidate in ["rollout/ep_rew_mean", "eval/mean_reward", "train/value_loss", "train/policy_gradient_loss"]:
+                if candidate in training_metrics.columns:
+                    y_col = candidate
+                    break
+            if y_col:
+                plot_df = training_metrics.copy()
+                if "step" not in plot_df.columns:
+                    plot_df["step"] = np.arange(len(plot_df))
+                fig = px.line(plot_df, x="step", y=y_col, title=f"{y_col} over training")
+                fig.update_layout(height=380)
                 st.plotly_chart(fig, width='stretch')
+            elif numeric_cols:
+                plot_df = training_metrics.copy().reset_index(drop=True)
+                if "step" not in plot_df.columns:
+                    plot_df["row_id"] = np.arange(len(plot_df))
+                    x_col = "row_id"
+                else:
+                    x_col = "step"
+                id_vars = [x_col]
+                melted = plot_df.melt(id_vars=id_vars, value_vars=numeric_cols[:4])
+                fig = px.line(melted, x=x_col, y="value", color="variable", title="Training metrics")
+                fig.update_layout(height=380)
+                st.plotly_chart(fig, width='stretch')
+
+        if run_data["cluster_ranking"] is not None and not run_data["cluster_ranking"].empty:
+            st.subheader("Cluster Ranking")
+            st.dataframe(run_data["cluster_ranking"], width='stretch', hide_index=True)
+
+        if run_data["selected_algos"] is not None and not run_data["selected_algos"].empty:
+            st.subheader("Selected Algorithms")
+            st.dataframe(run_data["selected_algos"].head(100), width='stretch', hide_index=True)
+            st.caption("Showing first 100 selected algorithms.")
+
+        with st.expander("Run Parameters", expanded=False):
+            render_key_value_table("Flattened Config", results.get("config", {}))
+
+        with st.expander("Run Metadata", expanded=False):
+            render_key_value_table("Run Info", run_info)
+
+        with st.expander("Execution Metrics", expanded=False):
+            render_key_value_table("Phase 5 Metrics", metrics)
+
+
+# ============================================================
+# PAGE: PHASE 6
+# ============================================================
+
+elif page == "🧭 Phase 6":
+    st.header("Phase 6: Walk-Forward Evaluation")
+    phase6_runs = resolve_phase6_run_dirs()
+    if not phase6_runs:
+        st.warning("No Phase 6 runs found under outputs/evaluation.")
+    else:
+        run_names = [p.name for p in phase6_runs]
+        selected_name = st.selectbox("Select Phase 6 run", run_names, index=0)
+        selected_dir = next(p for p in phase6_runs if p.name == selected_name)
+        run_data = load_phase6_run(selected_dir)
+        results = run_data["results"] or {}
+        metrics = run_data["metrics"] or {}
+        comparison_df = build_phase6_comparison_df(results)
+
+        st.caption(f"Run directory: `{selected_dir}`")
+
+        agents = results.get("agents", {})
+        agent_name = next(iter(agents.keys()), "unknown")
+        n_folds = results.get("n_folds", 0)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Agent", agent_name.upper())
+        c2.metric("Folds", f"{n_folds}")
+        c3.metric("Universe Size", f"{results.get('n_algos', 0):,}")
+
+        if comparison_df is not None and not comparison_df.empty:
+            st.subheader("Comparison")
+            st.dataframe(comparison_df, width='stretch', hide_index=True)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                fig = px.bar(comparison_df, x="name", y="sharpe_ratio", color="type", title="Sharpe by strategy")
+                fig.update_layout(height=380)
+                st.plotly_chart(fig, width='stretch')
+            with col2:
+                fig = px.bar(comparison_df, x="name", y="annualized_return", color="type", title="Annualized return by strategy")
+                fig.update_layout(height=380)
+                st.plotly_chart(fig, width='stretch')
+
+        if run_data["agent_folds"] is not None and Path(run_data["agent_folds"]).exists():
+            folds_df = load_csv_path(str(run_data["agent_folds"]))
+            if folds_df is not None and not folds_df.empty:
+                st.subheader("Agent Fold Metrics")
+                st.dataframe(folds_df, width='stretch', hide_index=True)
+
+        st.subheader("Equity: Agent vs Benchmark")
+        render_phase6_equity_plot(selected_dir, results)
+
+        if run_data["summary_md"]:
+            with st.expander("Phase 6 Summary Report", expanded=False):
+                st.markdown(run_data["summary_md"])
+
+        with st.expander("Run Parameters", expanded=False):
+            render_key_value_table("Phase 6 Config", results.get("config", {}))
+
+        with st.expander("Execution Metrics", expanded=False):
+            render_key_value_table("Phase 6 Metrics", metrics)
+
+
+# ============================================================
+# PAGE: SUMMARY
+# ============================================================
+
+elif page == "📋 Summary":
+    st.header("Summary")
+    phase6_runs = resolve_phase6_run_dirs()
+    phase5_runs = resolve_phase5_run_dirs()
+    if not phase6_runs:
+        st.warning("No Phase 6 runs found under outputs/evaluation.")
+    else:
+        phase6_names = [p.name for p in phase6_runs]
+        selected_phase6_name = st.selectbox("Select evaluation run", phase6_names, index=0)
+        selected_phase6_dir = next(p for p in phase6_runs if p.name == selected_phase6_name)
+        phase6_data = load_phase6_run(selected_phase6_dir)
+        phase6_results = phase6_data["results"] or {}
+        comparison_df = build_phase6_comparison_df(phase6_results)
+
+        inferred_phase5 = infer_phase5_run_from_phase6(phase6_results)
+        phase5_names = [p.name for p in phase5_runs]
+        if phase5_names:
+            default_idx = phase5_names.index(inferred_phase5) if inferred_phase5 in phase5_names else 0
+            selected_phase5_name = st.selectbox("Select training run", phase5_names, index=default_idx)
+            selected_phase5_dir = next((p for p in phase5_runs if p.name == selected_phase5_name), None)
+            phase5_data = load_phase5_run(selected_phase5_dir) if selected_phase5_dir else {}
+            phase5_results = phase5_data.get("results") or {}
+        else:
+            selected_phase5_name = None
+            selected_phase5_dir = None
+            phase5_data = {}
+            phase5_results = {}
+
+        st.subheader("Run Pairing")
+        col1, col2 = st.columns(2)
+        col1.caption(f"Phase 5: `{selected_phase5_name}`" if selected_phase5_name else "Phase 5: n/a")
+        col2.caption(f"Phase 6: `{selected_phase6_name}`")
+
+        top = st.columns(4)
+        cluster_sel = phase5_results.get("phase2_cluster_selection", {})
+        top[0].metric("Selected Clusters", ", ".join(map(str, cluster_sel.get("selected_clusters", []))) or "-")
+        top[1].metric("Selected Algos", f"{cluster_sel.get('selected_algo_count', phase5_results.get('n_algos', 0)):,}")
+        top[2].metric("Timesteps", f"{phase5_results.get('config', {}).get('total_timesteps', 0):,}")
+        top[3].metric("Folds", f"{phase6_results.get('n_folds', 0)}")
+
+        if comparison_df is not None and not comparison_df.empty:
+            st.subheader("Phase 6 Strategy Comparison")
+            st.dataframe(comparison_df, width='stretch', hide_index=True)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                fig = px.scatter(
+                    comparison_df,
+                    x="annualized_volatility",
+                    y="annualized_return",
+                    color="type",
+                    hover_name="name",
+                    size="sharpe_ratio",
+                    title="Return vs Volatility",
+                )
+                fig.update_layout(height=420)
+                st.plotly_chart(fig, width='stretch')
+            with col2:
+                fig = px.bar(
+                    comparison_df.sort_values("sharpe_ratio", ascending=False),
+                    x="name",
+                    y="sharpe_ratio",
+                    color="type",
+                    title="Sharpe ranking",
+                )
+                fig.update_layout(height=420)
+                st.plotly_chart(fig, width='stretch')
+
+        st.subheader("Equity")
+        render_phase6_equity_plot(selected_phase6_dir, phase6_results)
+
+        if phase5_data.get("selected_algos") is not None and not phase5_data["selected_algos"].empty:
+            with st.expander("Selected Algorithms from Phase 5", expanded=False):
+                st.dataframe(phase5_data["selected_algos"].head(100), width='stretch', hide_index=True)
+                st.caption("Showing first 100 selected algorithms.")
 
 
 # ============================================================

@@ -356,6 +356,11 @@ class Phase6Runner(PhaseRunner):
         models_dir = self._resolve_models_dir(args)
         output_dir = self.get_output_dir()
         self.logger.info(f"Evaluation run ID: {self._run_id or output_dir.name}")
+        eval_start, eval_end = self._resolve_eval_bounds(models_dir)
+        if eval_start is not None and eval_end is not None:
+            self.logger.info(
+                f"Restricting Phase 6 evaluation to Phase 5 holdout: {eval_start.date()} -> {eval_end.date()}"
+            )
 
         # ==================================================================
         # STEP 6.1: LOAD DATA
@@ -413,6 +418,20 @@ class Phase6Runner(PhaseRunner):
             )
 
             folds = validator.generate_folds(algo_returns.index)
+            if eval_start is not None and eval_end is not None:
+                folds = [
+                    fold for fold in folds
+                    if fold['test_start'] >= eval_start and fold['test_end'] <= eval_end
+                ]
+                self.logger.info(
+                    f"Filtered folds to holdout window: {len(folds)} folds remain inside "
+                    f"{eval_start.date()} -> {eval_end.date()}"
+                )
+                if not folds:
+                    raise ValueError(
+                        "No walk-forward folds remain after applying the Phase 5 holdout window. "
+                        "Adjust the Phase 6 windows or rerun Phase 5 with a compatible holdout."
+                    )
 
             if config.max_folds is not None:
                 folds = folds[:config.max_folds]
@@ -425,6 +444,12 @@ class Phase6Runner(PhaseRunner):
                 )
 
             results['n_folds'] = len(folds)
+            if eval_start is not None and eval_end is not None:
+                results['evaluation_window'] = {
+                    'start': str(eval_start.date()),
+                    'end': str(eval_end.date()),
+                    'source': 'phase5_test_split',
+                }
             results['folds'] = [
                 {k: str(v.date()) if hasattr(v, 'date') else v for k, v in fold.items()}
                 for fold in folds
@@ -512,6 +537,21 @@ class Phase6Runner(PhaseRunner):
                 pass
 
         return self.dp.processed.root
+
+    def _resolve_eval_bounds(self, models_dir: Path) -> tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+        """Read the Phase 5 test split and use it as the default out-of-sample evaluation window."""
+        phase5_results_path = models_dir.parent / "phase5_results.json"
+        if not phase5_results_path.exists():
+            return None, None
+        try:
+            payload = json.loads(phase5_results_path.read_text(encoding="utf-8"))
+            splits = payload.get("splits", {})
+            test_split = splits.get("test")
+            if isinstance(test_split, list) and len(test_split) == 2:
+                return pd.Timestamp(test_split[0]), pd.Timestamp(test_split[1])
+        except Exception:
+            return None, None
+        return None, None
 
     def _load_data(self, input_dir: Path):
         """Load Phase 1 data."""

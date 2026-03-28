@@ -138,6 +138,8 @@ class TrainingConfig:
     train_ratio: float = 0.6
     val_ratio: float = 0.2
     test_ratio: float = 0.2
+    holdout_start_date: Optional[str] = None
+    holdout_end_date: Optional[str] = None
 
     # Universe encoder (dimensionality reduction)
     use_encoder: bool = True
@@ -355,6 +357,14 @@ class Phase5Runner(PhaseRunner):
         parser.add_argument(
             '--input-dir', type=str, default=None,
             help='Override input directory (processed dataset root for training/eval universe)'
+        )
+        parser.add_argument(
+            '--holdout-start-date', type=str, default=None,
+            help='Optional holdout/test start date in YYYY-MM-DD format. Defaults to last calendar year when possible.'
+        )
+        parser.add_argument(
+            '--holdout-end-date', type=str, default=None,
+            help='Optional holdout/test end date in YYYY-MM-DD format. Defaults to last available date inside the holdout year.'
         )
         parser.add_argument(
             '--resume', type=str, default=None,
@@ -594,6 +604,8 @@ class Phase5Runner(PhaseRunner):
             cluster_score_threshold=getattr(args, 'cluster_score_threshold', 0.0),
             cluster_bonus_weight=getattr(args, 'cluster_bonus_weight', 0.001),
             reward_type=getattr(args, 'reward_type', 'risk_calibrated_returns'),
+            holdout_start_date=getattr(args, 'holdout_start_date', None),
+            holdout_end_date=getattr(args, 'holdout_end_date', None),
             phase2_cluster_filter=getattr(args, 'phase2_cluster_filter', False),
             phase2_analysis_dir=getattr(args, 'phase2_analysis_dir', None),
             phase2_cluster_source=getattr(args, 'phase2_cluster_source', 'behavioral_family'),
@@ -770,19 +782,59 @@ class Phase5Runner(PhaseRunner):
         with self.step("5.2 Compute Data Splits"):
             dates = algo_returns.index
             n = len(dates)
+            split_mode = "ratio"
+            holdout_start = None
+            holdout_end = None
 
-            train_end = int(n * config.train_ratio)
-            val_end = int(n * (config.train_ratio + config.val_ratio))
+            if config.holdout_start_date:
+                holdout_start = pd.Timestamp(config.holdout_start_date)
+                holdout_end = pd.Timestamp(config.holdout_end_date) if config.holdout_end_date else dates[-1]
+                split_mode = "explicit_holdout"
+            else:
+                last_year = int(dates[-1].year)
+                inferred_start = pd.Timestamp(f"{last_year}-01-01")
+                pre_holdout = dates[dates < inferred_start]
+                holdout = dates[dates >= inferred_start]
+                if len(pre_holdout) >= 252 and len(holdout) >= 126:
+                    holdout_start = inferred_start
+                    holdout_end = holdout[-1]
+                    split_mode = "calendar_holdout"
 
-            train_dates = (dates[0], dates[train_end - 1])
-            val_dates = (dates[train_end], dates[val_end - 1])
-            test_dates = (dates[val_end], dates[-1])
+            if holdout_start is not None:
+                dev_dates = dates[dates < holdout_start]
+                test_only_dates = dates[(dates >= holdout_start) & (dates <= holdout_end)]
+                if len(dev_dates) < 2 or len(test_only_dates) < 2:
+                    raise ValueError(
+                        f"Invalid holdout split: dev={len(dev_dates)} rows, test={len(test_only_dates)} rows, "
+                        f"holdout_start={holdout_start}, holdout_end={holdout_end}"
+                    )
 
-            self.logger.info(f"Train: {train_dates[0].date()} to {train_dates[1].date()} ({train_end} days)")
-            self.logger.info(f"Val:   {val_dates[0].date()} to {val_dates[1].date()} ({val_end - train_end} days)")
-            self.logger.info(f"Test:  {test_dates[0].date()} to {test_dates[1].date()} ({n - val_end} days)")
+                val_size = max(1, int(len(dev_dates) * (config.val_ratio / max(config.train_ratio + config.val_ratio, 1e-9))))
+                val_size = min(val_size, len(dev_dates) - 1)
+                train_dates = (dev_dates[0], dev_dates[-val_size - 1])
+                val_dates = (dev_dates[-val_size], dev_dates[-1])
+                test_dates = (test_only_dates[0], test_only_dates[-1])
+            else:
+                train_end = int(n * config.train_ratio)
+                val_end = int(n * (config.train_ratio + config.val_ratio))
+                train_dates = (dates[0], dates[train_end - 1])
+                val_dates = (dates[train_end], dates[val_end - 1])
+                test_dates = (dates[val_end], dates[-1])
+
+            train_len = len(dates[(dates >= train_dates[0]) & (dates <= train_dates[1])])
+            val_len = len(dates[(dates >= val_dates[0]) & (dates <= val_dates[1])])
+            test_len = len(dates[(dates >= test_dates[0]) & (dates <= test_dates[1])])
+
+            self.logger.info(
+                f"Split mode: {split_mode}"
+                + (f" ({holdout_start.date()} to {holdout_end.date()})" if holdout_start is not None else "")
+            )
+            self.logger.info(f"Train: {train_dates[0].date()} to {train_dates[1].date()} ({train_len} days)")
+            self.logger.info(f"Val:   {val_dates[0].date()} to {val_dates[1].date()} ({val_len} days)")
+            self.logger.info(f"Test:  {test_dates[0].date()} to {test_dates[1].date()} ({test_len} days)")
 
             results['splits'] = {
+                'mode': split_mode,
                 'train': [str(train_dates[0].date()), str(train_dates[1].date())],
                 'val': [str(val_dates[0].date()), str(val_dates[1].date())],
                 'test': [str(test_dates[0].date()), str(test_dates[1].date())],
