@@ -162,7 +162,7 @@ def mock_phase_inputs():
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_phase7_aco_walk_forward_runner_compares_with_benchmark(mock_phase_inputs):
+def test_phase7_aco_walk_forward_runner_builds_risk_reference(mock_phase_inputs):
     runner = Phase7ACOWalkForwardRunner()
     runner.dp = _build_test_data_paths(mock_phase_inputs)
     output_dir = mock_phase_inputs / "outputs"
@@ -201,6 +201,6 @@ def test_phase7_aco_walk_forward_runner_compares_with_benchmark(mock_phase_input
     assert (wf_dir / "portfolio_test_returns.csv").exists()
 
     folds_df = pd.read_csv(wf_dir / "folds.csv")
-    assert "test_excess_total_return" in folds_df.columns
-    assert "test_daily_hit_rate_vs_benchmark" in folds_df.columns
-    assert "test_beat_benchmark_total_return" in folds_df.columns
+    assert "test_volatility_gap" in folds_df.columns
+    assert "test_drawdown_gap" in folds_df.columns
+    assert "test_risk_alignment_score" in folds_df.columns

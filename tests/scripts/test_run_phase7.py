@@ -135,12 +135,13 @@ def test_phase7_runner_executes_with_existing_artifacts(mock_phase_inputs, tmp_p
     )
 
     assert results["status"] == "completed"
-    assert (tmp_path / "phase7" / "weights" / "weights.parquet").exists()
-    assert (tmp_path / "phase7" / "backtests" / "portfolio_returns.csv").exists()
-    assert (tmp_path / "phase7" / "reports" / "summary.json").exists()
-    assert (tmp_path / "phase7" / "reports" / "comparison.json").exists()
-    assert "benchmark_annualized_return" in results["summary"]
-    assert "beat_benchmark_total_return" in results["comparison"]
+    # Outputs are in a timestamped subdir; use paths from results dict
+    assert Path(results["outputs"]["weights_path"]).exists()
+    assert Path(results["outputs"]["portfolio_returns_path"]).exists()
+    assert Path(results["outputs"]["summary_path"]).exists()
+    assert Path(results["outputs"]["comparison_path"]).exists()
+    assert "benchmark_annualized_volatility" in results["summary"]
+    assert "risk_alignment_score" in results["comparison"]
     assert results["artifacts"]["cluster_history_available"] is True
     assert results["artifacts"]["cluster_stability_available"] is True
     assert results["artifacts"]["cluster_alpha_scores_available"] is True

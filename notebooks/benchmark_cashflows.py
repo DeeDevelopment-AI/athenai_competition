@@ -30,6 +30,8 @@ import argparse
 import warnings
 warnings.filterwarnings('ignore')
 
+from notebook_paths import default_output_dir, raw_benchmark_path
+
 
 def build_daily_timeline(trades_path):
     """
@@ -209,9 +211,9 @@ def algo_rotation_analysis(trades_df):
 
 def main():
     parser = argparse.ArgumentParser(description='GIPS cashflow analysis')
-    parser.add_argument('--trades', required=True)
-    parser.add_argument('--monthly', default=None)
-    parser.add_argument('--output', default='results/cashflows')
+    parser.add_argument('--trades', default=str(raw_benchmark_path('trades_benchmark.csv')))
+    parser.add_argument('--monthly', default=str(raw_benchmark_path('benchmark_monthly_returns.csv')))
+    parser.add_argument('--output', default=str(default_output_dir('cashflows')))
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
 

@@ -189,7 +189,7 @@ class SwarmConfig:
     under_investment_penalty_weight: float = 0.35
     seed: int = 42
     use_gpu: bool = True
-    objective_name: str = "alpha_risk_balanced"
+    objective_name: str = "risk_calibrated_return"
     selection_mode: str = "legacy"
     normalize_objective_metrics: bool = False
     min_selection_sharpe_21d: float = 0.10
@@ -1477,12 +1477,28 @@ class SwarmAllocatorBacktester:
         comparison.update(
             {
                 "benchmark_total_return": benchmark_total,
+                "benchmark_annualized_volatility": float(benchmark_metrics.get("annualized_volatility", 0.0)),
                 "benchmark_annualized_return": float(benchmark_metrics.get("annualized_return", 0.0)),
                 "benchmark_sharpe_ratio": float(benchmark_metrics.get("sharpe_ratio", 0.0)),
                 "benchmark_max_drawdown": float(benchmark_metrics.get("max_drawdown", 0.0)),
-                "excess_total_return": portfolio_total - benchmark_total,
-                "beat_benchmark_total_return": bool(portfolio_total > benchmark_total),
-                "daily_hit_rate_vs_benchmark": float((aligned["portfolio"] > aligned["benchmark"]).mean()),
+            }
+        )
+        portfolio_metrics = compute_full_metrics(aligned["portfolio"])
+        volatility_gap = float(
+            portfolio_metrics.get("annualized_volatility", 0.0)
+            - benchmark_metrics.get("annualized_volatility", 0.0)
+        )
+        drawdown_gap = float(
+            abs(portfolio_metrics.get("max_drawdown", 0.0))
+            - abs(benchmark_metrics.get("max_drawdown", 0.0))
+        )
+        comparison.update(
+            {
+                "volatility_gap": volatility_gap,
+                "drawdown_gap": drawdown_gap,
+                "abs_volatility_gap": abs(volatility_gap),
+                "abs_drawdown_gap": abs(drawdown_gap),
+                "risk_alignment_score": float(1.0 / (1.0 + abs(volatility_gap) + abs(drawdown_gap))),
             }
         )
         return comparison

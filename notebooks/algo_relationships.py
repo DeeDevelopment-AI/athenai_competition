@@ -36,6 +36,7 @@ warnings.filterwarnings('ignore')
 
 # Import loader from pipeline
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from notebook_paths import default_output_dir, raw_algos_path
 try:
     from algo_pipeline import load_algorithm_csv
 except ImportError:
@@ -437,8 +438,8 @@ def compute_aggregate_stats(corr_matrix, df_pairs, df_coint):
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze relationships between algorithms')
-    parser.add_argument('--algos', required=True, help='Directory with algorithm CSVs')
-    parser.add_argument('--output', default='results', help='Output directory')
+    parser.add_argument('--algos', default=str(raw_algos_path()), help='Directory with algorithm CSVs')
+    parser.add_argument('--output', default=str(default_output_dir('relationships')), help='Output directory')
     parser.add_argument('--limit', type=int, default=None, help='Limit algos (for testing)')
     parser.add_argument('--top-pairs', type=int, default=500, help='Number of top pairs to extract')
     parser.add_argument('--coint-tests', type=int, default=300, help='Max cointegration tests')

@@ -51,7 +51,7 @@ Objective Weight Options:
   --regime-focus F              Regime focus multiplier (default: 1.50)
 
 Advanced Options:
-  --objective-name S            Name of the objective function (default: alpha_risk_balanced)
+  --objective-name S            Name of the objective function (default: risk_calibrated_return)
   --selection-mode S            Universe selection: legacy, benchmark_aware (default: legacy)
   --normalize-objective-metrics Normalize objective components cross-sectionally
   --temporal-split S            Temporal eval split: none, auto (default: auto)
@@ -113,6 +113,14 @@ class Phase7Runner(PhaseRunner):
     phase_name = "Phase 7: Swarm Meta-Allocator"
     phase_number = 7
 
+    def _run_tag(self) -> str:
+        if not self.args:
+            return ""
+        particles = getattr(self.args, 'particles', 128)
+        iterations = getattr(self.args, 'iterations', 80)
+        factor = getattr(self.args, 'selection_factor', 'rolling_sharpe_21d')
+        return f"pso_{particles}p_{iterations}i_{factor}"
+
     def add_arguments(self, parser: argparse.ArgumentParser):
         parser.add_argument("--sample", type=int, default=None, help="Use only N algorithms")
         parser.add_argument("--top-k", type=int, default=256, help="Candidate pool size passed to the optimizer")
@@ -153,7 +161,7 @@ class Phase7Runner(PhaseRunner):
         parser.add_argument("--min-active-weight", type=float, default=0.0025)
         parser.add_argument("--min-gross-exposure", type=float, default=0.85)
         parser.add_argument("--under-investment-penalty-weight", type=float, default=0.35)
-        parser.add_argument("--objective-name", type=str, default="alpha_risk_balanced")
+        parser.add_argument("--objective-name", type=str, default="risk_calibrated_return")
         parser.add_argument(
             "--selection-mode",
             type=str,
@@ -170,6 +178,24 @@ class Phase7Runner(PhaseRunner):
         parser.add_argument("--cpu-only", action="store_true", help="Disable GPU usage")
         parser.add_argument("--input-dir", type=str, default=None, help="Override Phase 1 processed directory")
         parser.add_argument("--analysis-dir", type=str, default=None, help="Override Phase 2 analysis directory")
+        parser.add_argument("--phase2-cluster-filter", action="store_true", help="Restrict the swarm universe to the best Phase 2 clusters")
+        parser.add_argument(
+            "--phase2-cluster-source",
+            type=str,
+            default="temporal_cumulative",
+            choices=["behavioral_family", "temporal_cumulative", "temporal_weekly", "temporal_monthly"],
+        )
+        parser.add_argument(
+            "--phase2-cluster-score-mode",
+            type=str,
+            default="return_low_vol",
+            choices=["return_low_vol", "return", "sharpe", "sortino"],
+        )
+        parser.add_argument("--phase2-cluster-top-k", type=int, default=1)
+        parser.add_argument("--phase2-cluster-min-size", type=int, default=20)
+        parser.add_argument("--phase2-cluster-min-return", type=float, default=0.01)
+        parser.add_argument("--phase2-cluster-max-vol", type=float, default=0.12)
+        parser.add_argument("--phase2-cluster-full-history", action="store_true")
         parser.add_argument(
             "--temporal-split",
             type=str,
@@ -188,7 +214,10 @@ class Phase7Runner(PhaseRunner):
 
         input_dir = Path(args.input_dir) if args.input_dir else self.dp.processed.root
         analysis_dir = Path(args.analysis_dir) if args.analysis_dir else self.dp.processed.analysis.root
+
+        # Output dir and run_id are managed by PhaseRunner.execute() via _run_tag()
         output_dir = self.get_output_dir()
+        self.logger.info(f"Swarm PSO run ID: {self._run_id or output_dir.name}")
 
         with self.step("7.1 Load Phase 1 Artifacts"):
             sampled_cols = self._resolve_sampled_algorithms(input_dir, args.sample)
@@ -201,6 +230,27 @@ class Phase7Runner(PhaseRunner):
             results["artifacts"]["features_available"] = features is not None
             results["artifacts"]["benchmark_returns_available"] = benchmark_returns is not None
             results["artifacts"]["benchmark_weights_available"] = benchmark_weights is not None
+
+        if args.phase2_cluster_filter:
+            with self.step("7.1.5 Apply Phase 2 Cluster Universe"):
+                algo_returns, features, benchmark_weights, cluster_selection = self._apply_phase2_cluster_universe(
+                    algo_returns=algo_returns,
+                    features=features,
+                    benchmark_weights=benchmark_weights,
+                    analysis_dir=analysis_dir,
+                    output_dir=output_dir,
+                    source=args.phase2_cluster_source,
+                    score_mode=args.phase2_cluster_score_mode,
+                    top_k=args.phase2_cluster_top_k,
+                    min_size=args.phase2_cluster_min_size,
+                    min_return=args.phase2_cluster_min_return,
+                    max_vol=args.phase2_cluster_max_vol,
+                    latest_only=not args.phase2_cluster_full_history,
+                )
+                results["phase2_cluster_selection"] = cluster_selection
+                results["artifacts"]["returns_shape"] = list(algo_returns.shape)
+                results["artifacts"]["features_available"] = features is not None
+                results["artifacts"]["benchmark_weights_available"] = benchmark_weights is not None
 
         with self.step("7.2 Load Optional Phase 2 Artifacts"):
             family_labels = self._load_optional_family_labels(
@@ -362,6 +412,69 @@ class Phase7Runner(PhaseRunner):
         if sample >= len(columns):
             return None
         return columns[:sample]
+
+    def _apply_phase2_cluster_universe(
+        self,
+        algo_returns: pd.DataFrame,
+        features: pd.DataFrame | None,
+        benchmark_weights: pd.DataFrame | None,
+        analysis_dir: Path,
+        output_dir: Path,
+        source: str,
+        score_mode: str,
+        top_k: int,
+        min_size: int,
+        min_return: float | None,
+        max_vol: float | None,
+        latest_only: bool,
+    ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, dict]:
+        from src.analysis.phase2_cluster_selector import (
+            Phase2ClusterSelectionConfig,
+            Phase2ClusterSelector,
+        )
+
+        selector = Phase2ClusterSelector(analysis_dir)
+        selected_algos, cluster_ranking, selected_clusters = selector.select(
+            Phase2ClusterSelectionConfig(
+                source=source,
+                score_mode=score_mode,
+                top_k=top_k,
+                min_cluster_size=min_size,
+                min_return=min_return,
+                max_vol=max_vol,
+                latest_only=latest_only,
+            )
+        )
+        selected_cols = [c for c in algo_returns.columns if c in selected_algos]
+        filtered_returns = algo_returns[selected_cols]
+        filtered_features = None
+        if features is not None:
+            prefixes = tuple(f"{algo}_" for algo in selected_cols)
+            keep_columns = [
+                col for col in features.columns
+                if col.startswith("rolling_market") or col.startswith(prefixes)
+            ]
+            filtered_features = features[keep_columns].copy() if keep_columns else None
+        filtered_benchmark = benchmark_weights.reindex(columns=selected_cols, fill_value=0.0) if benchmark_weights is not None else None
+
+        cluster_selection_dir = output_dir / "cluster_selection"
+        cluster_selection_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"algo_id": selected_cols}).to_csv(cluster_selection_dir / "selected_algos.csv", index=False)
+        cluster_ranking.reset_index().to_csv(cluster_selection_dir / "cluster_ranking.csv", index=False)
+
+        selection_info = {
+            "analysis_dir": str(selector.analysis_root.resolve()),
+            "source": source,
+            "score_mode": score_mode,
+            "top_k": top_k,
+            "selected_clusters": selected_clusters,
+            "selected_algo_count": len(selected_cols),
+            "latest_only": latest_only,
+        }
+        self.logger.info(
+            f"Applied Phase 2 cluster universe: source={source}, clusters={selected_clusters}, algos={len(selected_cols)}"
+        )
+        return filtered_returns, filtered_features, filtered_benchmark, selection_info
 
     def _peek_parquet_columns(self, path: Path) -> list[str]:
         return list(pq.ParquetFile(path).schema.names)
@@ -720,19 +833,13 @@ features, and optional Phase 2 family/regime artifacts.
 | Valid Return Observations | {summary.get("valid_return_observations", 0)} |
 | Device | {summary.get("device", "cpu")} |
 
-## Benchmark Comparison
+## Risk Reference
 
-| Metric | Swarm | Benchmark | Delta |
-|--------|-------|-----------|-------|
-| Total Return | {summary.get("portfolio_total_return", 0):.2%} | {summary.get("benchmark_total_return", 0):.2%} | {summary.get("excess_total_return", 0):.2%} |
-| Annualized Return | {summary.get("annualized_return", 0):.2%} | {summary.get("benchmark_annualized_return", 0):.2%} | {(summary.get("annualized_return", 0) - summary.get("benchmark_annualized_return", 0)):.2%} |
-| Sharpe Ratio | {summary.get("sharpe_ratio", 0):.3f} | {summary.get("benchmark_sharpe_ratio", 0):.3f} | {(summary.get("sharpe_ratio", 0) - summary.get("benchmark_sharpe_ratio", 0)):.3f} |
-| Max Drawdown | {summary.get("max_drawdown", 0):.2%} | {summary.get("benchmark_max_drawdown", 0):.2%} | {(summary.get("max_drawdown", 0) - summary.get("benchmark_max_drawdown", 0)):.2%} |
-
-## Headline
-
-- Beat benchmark by total return: {comparison.get("beat_benchmark_total_return", False)}
-- Daily hit rate vs benchmark: {comparison.get("daily_hit_rate_vs_benchmark", 0):.2%}
+| Metric | Swarm | Benchmark Reference | Gap |
+|--------|-------|---------------------|-----|
+| Annualized Volatility | {summary.get("annualized_volatility", 0):.2%} | {summary.get("benchmark_annualized_volatility", 0):.2%} | {comparison.get("volatility_gap", 0):.2%} |
+| Max Drawdown | {summary.get("max_drawdown", 0):.2%} | {summary.get("benchmark_max_drawdown", 0):.2%} | {comparison.get("drawdown_gap", 0):.2%} |
+| Risk Alignment Score | {comparison.get("risk_alignment_score", 0):.3f} | n/a | n/a |
 
 ## Temporal Split
 
@@ -745,7 +852,8 @@ features, and optional Phase 2 family/regime artifacts.
                     f"{split.get('start_date', 'n/a')} -> {split.get('end_date', 'n/a')} | "
                     f"return={split.get('annualized_return', 0):.2%} | "
                     f"sharpe={split.get('sharpe_ratio', 0):.3f} | "
-                    f"benchmark_return={split.get('benchmark_annualized_return', 0):.2%}\n"
+                    f"benchmark_vol={split.get('benchmark_annualized_volatility', 0):.2%} | "
+                    f"benchmark_max_dd={split.get('benchmark_max_drawdown', 0):.2%}\n"
                 )
         else:
             report += "- Temporal split evaluation disabled\n"
@@ -784,27 +892,26 @@ outputs/swarm_allocator/
         )
         if comparison:
             self.logger.info(
-                "Benchmark: return=%s | sharpe=%.3f | max_dd=%s",
-                f"{summary.get('benchmark_annualized_return', 0):.2%}",
-                summary.get("benchmark_sharpe_ratio", 0.0),
+                "Benchmark risk anchor: vol=%s | max_dd=%s",
+                f"{summary.get('benchmark_annualized_volatility', 0):.2%}",
                 f"{summary.get('benchmark_max_drawdown', 0):.2%}",
             )
             self.logger.info(
-                "Comparison: total_return_delta=%s | beat_benchmark=%s | daily_hit_rate=%s",
-                f"{summary.get('excess_total_return', 0):.2%}",
-                comparison.get("beat_benchmark_total_return", False),
-                f"{comparison.get('daily_hit_rate_vs_benchmark', 0):.2%}",
+                "Risk alignment: vol_gap=%s | drawdown_gap=%s | score=%.3f",
+                f"{comparison.get('volatility_gap', 0):.2%}",
+                f"{comparison.get('drawdown_gap', 0):.2%}",
+                comparison.get("risk_alignment_score", 0.0),
             )
         split_summary = results.get("split_summary", {})
         test_split = split_summary.get("test", {}) if split_summary else {}
         if test_split:
             self.logger.info(
-                "Temporal test: %s -> %s | return=%s | sharpe=%.3f | benchmark=%s",
+                "Temporal test: %s -> %s | return=%s | sharpe=%.3f | benchmark_vol=%s",
                 test_split.get("start_date", "n/a"),
                 test_split.get("end_date", "n/a"),
                 f"{test_split.get('annualized_return', 0):.2%}",
                 test_split.get("sharpe_ratio", 0.0),
-                f"{test_split.get('benchmark_annualized_return', 0):.2%}",
+                f"{test_split.get('benchmark_annualized_volatility', 0):.2%}",
             )
         self.logger.info(
             "Artifacts: %s",
@@ -852,7 +959,9 @@ outputs/swarm_allocator/
             if segment_benchmark is not None and not segment_benchmark.empty:
                 benchmark_metrics = compute_full_metrics(segment_benchmark)
                 metrics["benchmark_annualized_return"] = float(benchmark_metrics.get("annualized_return", 0.0))
+                metrics["benchmark_annualized_volatility"] = float(benchmark_metrics.get("annualized_volatility", 0.0))
                 metrics["benchmark_sharpe_ratio"] = float(benchmark_metrics.get("sharpe_ratio", 0.0))
+                metrics["benchmark_max_drawdown"] = float(benchmark_metrics.get("max_drawdown", 0.0))
             summary[name] = metrics
 
         summary["split_meta"] = {

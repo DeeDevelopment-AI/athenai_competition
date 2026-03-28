@@ -240,8 +240,16 @@ class ReportDataPaths:
         return self.root / "phase1" / "results.json"
 
     @property
+    def phase1_metrics(self) -> Path:
+        return self.root / "phase1" / "metrics.json"
+
+    @property
     def phase2_results(self) -> Path:
         return self.root / "phase2" / "results.json"
+
+    @property
+    def phase2_metrics(self) -> Path:
+        return self.root / "phase2" / "metrics.json"
 
 
 @dataclass(frozen=True)
@@ -253,14 +261,12 @@ class ProcessedDataPaths:
     benchmark: BenchmarkDataPaths = None
     analysis: AnalysisDataPaths = None
     features: FeatureDataPaths = None
-    reports: ReportDataPaths = None
 
     def __post_init__(self):
         object.__setattr__(self, 'algorithms', AlgorithmDataPaths())
         object.__setattr__(self, 'benchmark', BenchmarkDataPaths())
         object.__setattr__(self, 'analysis', AnalysisDataPaths())
         object.__setattr__(self, 'features', FeatureDataPaths())
-        object.__setattr__(self, 'reports', ReportDataPaths())
 
 
 @dataclass(frozen=True)
@@ -347,41 +353,78 @@ class EvaluationOutputPaths:
 
 
 @dataclass(frozen=True)
-class SwarmOutputPaths:
-    """Paths for Phase 7 swarm meta-allocator outputs."""
-    root: Path = PROJECT_ROOT / "outputs" / "swarm_allocator"
+class DataPipelineOutputPaths:
+    """Paths for Phase 1 data pipeline reports."""
+    root: Path = PROJECT_ROOT / "outputs" / "data_pipeline"
+
+
+@dataclass(frozen=True)
+class AnalysisOutputPaths:
+    """Paths for Phase 2 analysis reports."""
+    root: Path = PROJECT_ROOT / "outputs" / "analysis"
+
+
+@dataclass(frozen=True)
+class EnvironmentOutputPaths:
+    """Paths for Phase 4 environment validation outputs."""
+    root: Path = PROJECT_ROOT / "outputs" / "environment"
+
+
+@dataclass(frozen=True)
+class SwarmPSOOutputPaths:
+    """Paths for Phase 7 PSO swarm meta-allocator outputs."""
+    root: Path = PROJECT_ROOT / "outputs" / "swarm_pso"
+
+    def run_dir(self, run_id: str) -> Path:
+        """Get the directory for a specific run."""
+        return self.root / run_id
 
     @property
-    def weights_dir(self) -> Path:
-        return self.root / "weights"
+    def latest_run_file(self) -> Path:
+        return self.root / "latest_run.txt"
+
+
+@dataclass(frozen=True)
+class SwarmACOOutputPaths:
+    """Paths for Phase 7A ACO swarm meta-allocator outputs."""
+    root: Path = PROJECT_ROOT / "outputs" / "swarm_aco"
+
+    def run_dir(self, run_id: str) -> Path:
+        """Get the directory for a specific run."""
+        return self.root / run_id
 
     @property
-    def backtests_dir(self) -> Path:
-        return self.root / "backtests"
-
-    @property
-    def diagnostics_dir(self) -> Path:
-        return self.root / "diagnostics"
-
-    @property
-    def reports_dir(self) -> Path:
-        return self.root / "reports"
+    def latest_run_file(self) -> Path:
+        return self.root / "latest_run.txt"
 
 
 @dataclass(frozen=True)
 class OutputPaths:
     """All output paths."""
     root: Path = PROJECT_ROOT / "outputs"
+    data_pipeline: DataPipelineOutputPaths = None
+    analysis: AnalysisOutputPaths = None
     baselines: BaselineOutputPaths = None
+    environment: EnvironmentOutputPaths = None
     rl_training: RLTrainingOutputPaths = None
     evaluation: EvaluationOutputPaths = None
-    swarm: SwarmOutputPaths = None
+    swarm_pso: SwarmPSOOutputPaths = None
+    swarm_aco: SwarmACOOutputPaths = None
 
     def __post_init__(self):
+        object.__setattr__(self, 'data_pipeline', DataPipelineOutputPaths())
+        object.__setattr__(self, 'analysis', AnalysisOutputPaths())
         object.__setattr__(self, 'baselines', BaselineOutputPaths())
+        object.__setattr__(self, 'environment', EnvironmentOutputPaths())
         object.__setattr__(self, 'rl_training', RLTrainingOutputPaths())
         object.__setattr__(self, 'evaluation', EvaluationOutputPaths())
-        object.__setattr__(self, 'swarm', SwarmOutputPaths())
+        object.__setattr__(self, 'swarm_pso', SwarmPSOOutputPaths())
+        object.__setattr__(self, 'swarm_aco', SwarmACOOutputPaths())
+
+    @property
+    def swarm(self) -> SwarmPSOOutputPaths:
+        """Backward-compatibility alias for swarm_pso."""
+        return self.swarm_pso
 
     @property
     def reports_dir(self) -> Path:
@@ -439,6 +482,7 @@ def get_legacy_to_new_mapping() -> dict:
     Use this to update existing code or migrate files.
     """
     dp = DataPaths()
+    op = OutputPaths()
     return {
         # Algorithm data
         "algo_returns.parquet": dp.algorithms.returns,
@@ -455,9 +499,9 @@ def get_legacy_to_new_mapping() -> dict:
         "benchmark_algo_equity.parquet": dp.benchmark.algo_equity,
         "benchmark_algo_features.parquet": dp.benchmark.algo_features,
 
-        # Reports
-        "PHASE1_SUMMARY.md": dp.processed.reports.phase1_summary,
-        "phase1_results.json": dp.processed.reports.phase1_results,
+        # Reports (now in outputs/)
+        "PHASE1_SUMMARY.md": op.data_pipeline.root / "PHASE1_SUMMARY.md",
+        "phase1_results.json": op.data_pipeline.root / "phase1_results.json",
 
         # Analysis
         "regime_features.parquet": dp.features.regime,

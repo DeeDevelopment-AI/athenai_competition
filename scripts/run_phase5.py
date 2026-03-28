@@ -126,11 +126,10 @@ class TrainingConfig:
     impact_coefficient: float = 0.1
 
     # Reward
-    # Options: "calibrated_alpha" (recommended), "pure_returns", "alpha_penalized"
-    # calibrated_alpha: penalties auto-normalized to be comparable to alpha signal
-    reward_type: str = "calibrated_alpha"
+    # The benchmark is only a risk anchor. The objective is absolute return.
+    reward_type: str = "risk_calibrated_returns"
     reward_scale: float = 100.0
-    # Legacy penalty weights (only used with alpha_penalized, ignored by calibrated_alpha)
+    # Penalty weights for absolute-return rewards
     cost_penalty: float = 1.0
     turnover_penalty: float = 0.005
     drawdown_penalty: float = 0.1
@@ -151,6 +150,30 @@ class TrainingConfig:
     hybrid_mode: bool = True  # Enable by default for better training stability
     base_allocator: str = "risk_parity"  # "risk_parity", "equal_weight", "min_variance"
     max_tilt: float = 0.15  # Maximum tilt per asset (±15%)
+
+    # Behavioral Cloning warm-start (--pretrain-bc)
+    bc_pretrain: bool = False
+    bc_strategy: str = "risk_parity"        # Baseline allocator to imitate
+    bc_epochs: int = 10                      # Supervised epochs before RL
+    bc_lr: float = 1e-3                      # BC learning rate (higher than RL)
+    bc_batch_size: int = 256
+    bc_lookback: int = 63                    # Lookback for the expert allocator
+
+    # Cluster-based universe filter (--cluster-filter)
+    cluster_filter: bool = False
+    cluster_filter_mode: str = "hard"        # "hard" (pre-filter) or "soft" (reward shaping)
+    cluster_score_metric: str = "sharpe"     # "sharpe", "return", "sortino"
+    cluster_score_threshold: float = 0.0     # Remove families with score < threshold
+    cluster_bonus_weight: float = 0.001      # Reward bonus weight (soft mode)
+    phase2_cluster_filter: bool = False
+    phase2_analysis_dir: Optional[str] = None
+    phase2_cluster_source: str = "behavioral_family"
+    phase2_cluster_score_mode: str = "return_low_vol"
+    phase2_cluster_top_k: int = 1
+    phase2_cluster_min_size: int = 25
+    phase2_cluster_min_return: Optional[float] = 0.0
+    phase2_cluster_max_vol: Optional[float] = None
+    phase2_cluster_latest_only: bool = True
 
 
 def parse_timesteps(value: str) -> int:
@@ -271,6 +294,24 @@ class Phase5Runner(PhaseRunner):
     phase_name = "Phase 5: RL Agent Training"
     phase_number = 5
 
+    def _make_run_id(self) -> str:
+        """Phase 5 run ID: timestamp + agent + optional bc/cluster flags."""
+        if getattr(self.args, 'run_id', None):
+            base = self.args.run_id
+        else:
+            base = datetime.now().strftime("%Y%m%d_%H%M%S")
+        parts = [base]
+        agent = getattr(self.args, 'agent', 'ppo')
+        if agent != 'all':
+            parts.append(agent)
+        if getattr(self.args, 'pretrain_bc', False):
+            strategy = getattr(self.args, 'bc_strategy', 'rp')
+            parts.append(f"bc_{strategy[:2]}")
+        if getattr(self.args, 'cluster_filter', False):
+            mode = getattr(self.args, 'cluster_filter_mode', 'hard')[:1]
+            parts.append(f"cf{mode}")
+        return "_".join(parts)
+
     def add_arguments(self, parser: argparse.ArgumentParser):
         """Add Phase 5 specific arguments."""
         parser.add_argument(
@@ -313,7 +354,7 @@ class Phase5Runner(PhaseRunner):
         )
         parser.add_argument(
             '--input-dir', type=str, default=None,
-            help='Override input directory (Phase 1 outputs)'
+            help='Override input directory (processed dataset root for training/eval universe)'
         )
         parser.add_argument(
             '--resume', type=str, default=None,
@@ -377,6 +418,111 @@ class Phase5Runner(PhaseRunner):
             '--gpu-env', action='store_true',
             help='Use GPU-accelerated batched environment (requires CUDA)'
         )
+        # ------------------------------------------------------------------
+        # Behavioral Cloning warm-start
+        # ------------------------------------------------------------------
+        parser.add_argument(
+            '--pretrain-bc', action='store_true',
+            help=(
+                'Pre-train the RL policy to imitate a Phase 3 baseline via behavioral cloning '
+                'before PPO/SAC/TD3 fine-tuning. Reduces cold-start exploration.'
+            )
+        )
+        parser.add_argument(
+            '--bc-strategy', type=str, default='risk_parity',
+            choices=['equal_weight', 'risk_parity', 'min_variance', 'max_sharpe', 'momentum', 'vol_targeting'],
+            help='Phase 3 allocator to imitate during BC pre-training (default: risk_parity)'
+        )
+        parser.add_argument(
+            '--bc-epochs', type=int, default=10,
+            help='Number of supervised BC epochs (default: 10)'
+        )
+        parser.add_argument(
+            '--bc-lr', type=float, default=1e-3,
+            help='Learning rate for BC pre-training (default: 1e-3, higher than RL)'
+        )
+        parser.add_argument(
+            '--bc-batch-size', type=int, default=256,
+            help='Mini-batch size for BC pre-training (default: 256)'
+        )
+        parser.add_argument(
+            '--bc-lookback', type=int, default=63,
+            help='Lookback window (days) for the expert allocator (default: 63)'
+        )
+        # ------------------------------------------------------------------
+        # Cluster-based universe filter
+        # ------------------------------------------------------------------
+        parser.add_argument(
+            '--cluster-filter', action='store_true',
+            help=(
+                'Filter the algorithm universe using Phase 2 cluster quality scores. '
+                'Hard mode removes low-scoring families; soft mode shapes rewards.'
+            )
+        )
+        parser.add_argument(
+            '--cluster-filter-mode', type=str, default='hard', choices=['hard', 'soft'],
+            help=(
+                'hard: remove algorithms from low-scoring families before training. '
+                'soft: add a per-step reward bonus for allocating to high-scoring families. '
+                '(default: hard)'
+            )
+        )
+        parser.add_argument(
+            '--cluster-score-metric', type=str, default='sharpe',
+            choices=['sharpe', 'return', 'sortino'],
+            help='Metric used to score families (default: sharpe)'
+        )
+        parser.add_argument(
+            '--cluster-score-threshold', type=float, default=0.0,
+            help='Remove families with median score below this threshold (default: 0.0)'
+        )
+        parser.add_argument(
+            '--cluster-bonus-weight', type=float, default=0.001,
+            help='Reward bonus weight for soft mode (default: 0.001)'
+        )
+        parser.add_argument(
+            '--reward-type', type=str, default='risk_calibrated_returns',
+            choices=['risk_calibrated_returns', 'absolute_returns', 'calibrated_alpha', 'pure_returns', 'alpha_penalized', 'info_ratio', 'risk_adjusted'],
+            help='Reward function type (default: risk_calibrated_returns)'
+        )
+        parser.add_argument(
+            '--phase2-cluster-filter', action='store_true',
+            help='Filter the Phase 5 universe using the best clusters detected in Phase 2'
+        )
+        parser.add_argument(
+            '--phase2-analysis-dir', type=str, default=None,
+            help='Path to a concrete Phase 2 analysis directory, snapshot, or outputs/analysis run dir'
+        )
+        parser.add_argument(
+            '--phase2-cluster-source', type=str, default='behavioral_family',
+            choices=['behavioral_family', 'temporal_cumulative', 'temporal_weekly', 'temporal_monthly'],
+            help='Phase 2 cluster source used to define the tradable universe'
+        )
+        parser.add_argument(
+            '--phase2-cluster-score-mode', type=str, default='return_low_vol',
+            choices=['return_low_vol', 'return', 'sharpe', 'sortino'],
+            help='How to score Phase 2 clusters before selecting the top ones'
+        )
+        parser.add_argument(
+            '--phase2-cluster-top-k', type=int, default=1,
+            help='Number of best Phase 2 clusters to include in the training universe'
+        )
+        parser.add_argument(
+            '--phase2-cluster-min-size', type=int, default=25,
+            help='Minimum size required for a Phase 2 cluster to be eligible'
+        )
+        parser.add_argument(
+            '--phase2-cluster-min-return', type=float, default=0.0,
+            help='Optional minimum mean annualized return required at cluster level'
+        )
+        parser.add_argument(
+            '--phase2-cluster-max-vol', type=float, default=None,
+            help='Optional maximum mean annualized volatility allowed at cluster level'
+        )
+        parser.add_argument(
+            '--phase2-cluster-full-history', action='store_true',
+            help='For temporal clusters, score clusters over full history instead of only the latest assignment'
+        )
 
     def run(self, args: argparse.Namespace) -> dict:
         """Execute Phase 5 pipeline."""
@@ -434,31 +580,35 @@ class Phase5Runner(PhaseRunner):
             hybrid_mode=not getattr(args, 'no_hybrid', False),
             base_allocator=getattr(args, 'base_allocator', 'risk_parity'),
             max_tilt=getattr(args, 'max_tilt', 0.15),
+            # BC warm-start
+            bc_pretrain=getattr(args, 'pretrain_bc', False),
+            bc_strategy=getattr(args, 'bc_strategy', 'risk_parity'),
+            bc_epochs=getattr(args, 'bc_epochs', 10),
+            bc_lr=getattr(args, 'bc_lr', 1e-3),
+            bc_batch_size=getattr(args, 'bc_batch_size', 256),
+            bc_lookback=getattr(args, 'bc_lookback', 63),
+            # Cluster filter
+            cluster_filter=getattr(args, 'cluster_filter', False),
+            cluster_filter_mode=getattr(args, 'cluster_filter_mode', 'hard'),
+            cluster_score_metric=getattr(args, 'cluster_score_metric', 'sharpe'),
+            cluster_score_threshold=getattr(args, 'cluster_score_threshold', 0.0),
+            cluster_bonus_weight=getattr(args, 'cluster_bonus_weight', 0.001),
+            reward_type=getattr(args, 'reward_type', 'risk_calibrated_returns'),
+            phase2_cluster_filter=getattr(args, 'phase2_cluster_filter', False),
+            phase2_analysis_dir=getattr(args, 'phase2_analysis_dir', None),
+            phase2_cluster_source=getattr(args, 'phase2_cluster_source', 'behavioral_family'),
+            phase2_cluster_score_mode=getattr(args, 'phase2_cluster_score_mode', 'return_low_vol'),
+            phase2_cluster_top_k=getattr(args, 'phase2_cluster_top_k', 1),
+            phase2_cluster_min_size=getattr(args, 'phase2_cluster_min_size', 25),
+            phase2_cluster_min_return=getattr(args, 'phase2_cluster_min_return', None),
+            phase2_cluster_max_vol=getattr(args, 'phase2_cluster_max_vol', None),
+            phase2_cluster_latest_only=not getattr(args, 'phase2_cluster_full_history', False),
         )
 
-        # ── Run ID: unique identifier for this training run ──────────────────
-        # Lets you keep multiple runs and always know which model was evaluated.
-        # Format: YYYYMMDD_HHMMSS  (or custom via --run-id)
-        from datetime import datetime as _dt
-        import json as _json
-
-        run_id = args.run_id or _dt.now().strftime("%Y%m%d_%H%M%S")
-        if args.agent != 'all':
-            # Suffix with agent name when training a single agent for clarity
-            run_id = f"{run_id}_{args.agent}"
-
-        # Output lives under outputs/rl_training/{run_id}/
-        rl_root = self.op.rl_training.root
-        output_dir = rl_root / run_id
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # ── latest_run.txt — Phase 6 reads this by default ───────────────────
-        latest_path = rl_root / "latest_run.txt"
-        latest_path.write_text(run_id)
-
-        self.logger.info(f"Run ID: {run_id}")
+        # Output dir and run_id are managed by PhaseRunner.execute() via _make_run_id()
+        output_dir = self.get_output_dir()
+        run_id = self._run_id or output_dir.name
         self.logger.info(f"Output: {output_dir}")
-        self.logger.info(f"Latest pointer updated: {latest_path}")
 
         results = {
             'run_id': run_id,
@@ -475,6 +625,59 @@ class Phase5Runner(PhaseRunner):
         # ==================================================================
         with self.step("5.1 Load Phase 1 Data"):
             algo_returns, benchmark_weights, benchmark_returns = self._load_data(input_dir)
+
+            if config.phase2_cluster_filter:
+                from src.analysis.phase2_cluster_selector import (
+                    Phase2ClusterSelectionConfig,
+                    Phase2ClusterSelector,
+                )
+
+                analysis_root = Path(config.phase2_analysis_dir) if config.phase2_analysis_dir else self.dp.processed.analysis.root
+                selector = Phase2ClusterSelector(analysis_root)
+                selection_cfg = Phase2ClusterSelectionConfig(
+                    source=config.phase2_cluster_source,
+                    score_mode=config.phase2_cluster_score_mode,
+                    top_k=config.phase2_cluster_top_k,
+                    min_cluster_size=config.phase2_cluster_min_size,
+                    min_return=config.phase2_cluster_min_return,
+                    max_vol=config.phase2_cluster_max_vol,
+                    latest_only=config.phase2_cluster_latest_only,
+                )
+                selected_algos, cluster_ranking, selected_clusters = selector.select(selection_cfg)
+                selected_cols = [c for c in algo_returns.columns if c in selected_algos]
+                if not selected_cols:
+                    raise ValueError(
+                        "Phase 2 cluster selection produced an empty universe after intersecting with returns."
+                    )
+                algo_returns = algo_returns[selected_cols]
+                if benchmark_weights is not None:
+                    benchmark_weights = benchmark_weights.reindex(columns=selected_cols, fill_value=0.0)
+
+                cluster_selection_dir = output_dir / 'cluster_selection'
+                cluster_selection_dir.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame({'algo_id': selected_cols}).to_csv(
+                    cluster_selection_dir / 'selected_algos.csv',
+                    index=False,
+                )
+                cluster_ranking.reset_index().to_csv(
+                    cluster_selection_dir / 'cluster_ranking.csv',
+                    index=False,
+                )
+
+                results['phase2_cluster_selection'] = {
+                    'analysis_dir': str(selector.analysis_root.resolve()),
+                    'source': config.phase2_cluster_source,
+                    'score_mode': config.phase2_cluster_score_mode,
+                    'top_k': config.phase2_cluster_top_k,
+                    'selected_clusters': selected_clusters,
+                    'selected_algo_count': len(selected_cols),
+                    'latest_only': config.phase2_cluster_latest_only,
+                }
+                self.logger.info(
+                    f"Phase 2 cluster selection applied: analysis={selector.analysis_root}, "
+                    f"source={config.phase2_cluster_source}, "
+                    f"clusters={selected_clusters}, algos={len(selected_cols)}"
+                )
 
             # Sample if requested - only from algorithms that have benchmark weights
             if args.sample and args.sample < len(algo_returns.columns):
@@ -498,6 +701,68 @@ class Phase5Runner(PhaseRunner):
             self.logger.info(f"Returns: {algo_returns.shape[0]} days x {algo_returns.shape[1]} algos")
             results['n_algos'] = algo_returns.shape[1]
             results['n_days'] = algo_returns.shape[0]
+
+        # ==================================================================
+        # STEP 5.1.5: CLUSTER UNIVERSE FILTER (optional)
+        # ==================================================================
+        cluster_filter_obj = None
+        if config.cluster_filter:
+            with self.step("5.1.5 Cluster Universe Filter"):
+                from src.environment.universe_filter import ClusterUniverseFilter, ClusterFilterConfig
+
+                family_labels_path = (
+                    self.dp.processed.root / 'analysis' / 'clustering' / 'behavioral' / 'family_labels.csv'
+                )
+                behavioral_features_path = (
+                    self.dp.processed.root / 'analysis' / 'clustering' / 'behavioral' / 'features.csv'
+                )
+
+                if not family_labels_path.exists() or not behavioral_features_path.exists():
+                    self.logger.warning(
+                        "Cluster data not found (Phase 2 must be run first). "
+                        "Skipping cluster filter."
+                    )
+                    config.cluster_filter = False
+                else:
+                    cf_config = ClusterFilterConfig(
+                        mode=config.cluster_filter_mode,
+                        score_metric=config.cluster_score_metric,
+                        threshold=config.cluster_score_threshold,
+                        bonus_weight=config.cluster_bonus_weight,
+                    )
+                    cluster_filter_obj = ClusterUniverseFilter(cf_config)
+                    cluster_filter_obj.load_cluster_data(family_labels_path, behavioral_features_path)
+
+                    if config.cluster_filter_mode == "hard":
+                        algo_returns, benchmark_weights = cluster_filter_obj.apply_hard_filter(
+                            algo_returns, benchmark_weights
+                        )
+                        results['cluster_filter'] = {
+                            'mode': 'hard',
+                            'n_algos_after': algo_returns.shape[1],
+                            'included_families': sorted(cluster_filter_obj.get_included_families()),
+                            'family_scores': {
+                                str(k): round(v, 4)
+                                for k, v in cluster_filter_obj.get_family_scores().items()
+                            },
+                        }
+                        self.logger.info(
+                            f"Universe after hard filter: "
+                            f"{algo_returns.shape[1]} algos, "
+                            f"{algo_returns.shape[0]} days"
+                        )
+                    else:
+                        # Soft mode: prepare per-algo scores; pass filter to env later
+                        cluster_filter_obj.prepare_for_env(algo_returns.columns.tolist())
+                        results['cluster_filter'] = {
+                            'mode': 'soft',
+                            'bonus_weight': config.cluster_bonus_weight,
+                            'family_scores': {
+                                str(k): round(v, 4)
+                                for k, v in cluster_filter_obj.get_family_scores().items()
+                            },
+                        }
+                        self.logger.info("Soft cluster filter ready (reward shaping enabled)")
 
         # ==================================================================
         # STEP 5.2: COMPUTE TRAIN/VAL/TEST SPLITS
@@ -594,6 +859,37 @@ class Phase5Runner(PhaseRunner):
 
             use_gpu_env = getattr(args, 'gpu_env', False) and torch.cuda.is_available()
 
+            # Define cost_model, constraints, reward_fn unconditionally — the BC
+            # pre-training step always uses a CPU TradingEnvironment regardless of
+            # whether the main training env is GPU-accelerated.
+            cost_model = CostModel(
+                spread_bps=config.spread_bps,
+                slippage_bps=config.slippage_bps,
+                impact_coefficient=config.impact_coefficient,
+            )
+            constraints = PortfolioConstraints(
+                max_weight=config.max_weight,
+                min_weight=config.min_weight,
+                max_turnover=config.max_turnover,
+                max_exposure=config.max_exposure,
+            )
+            _reward_type_map = {
+                "risk_calibrated_returns": RewardType.RISK_CALIBRATED_RETURNS,
+                "absolute_returns": RewardType.ABSOLUTE_RETURNS,
+                "calibrated_alpha": RewardType.RISK_CALIBRATED_RETURNS,
+                "pure_returns": RewardType.PURE_RETURNS,
+                "alpha_penalized": RewardType.ABSOLUTE_RETURNS,
+                "info_ratio": RewardType.INFORMATION_RATIO,
+                "risk_adjusted": RewardType.RISK_ADJUSTED,
+            }
+            reward_fn = RewardFunction(
+                reward_type=_reward_type_map.get(config.reward_type, RewardType.RISK_CALIBRATED_RETURNS),
+                cost_penalty_weight=config.cost_penalty,
+                turnover_penalty_weight=config.turnover_penalty,
+                drawdown_penalty_weight=config.drawdown_penalty,
+            )
+            self.logger.info(f"Using reward type: {config.reward_type}")
+
             if use_gpu_env:
                 # ============================================================
                 # GPU-ACCELERATED PATH
@@ -616,6 +912,8 @@ class Phase5Runner(PhaseRunner):
                     cost_penalty=config.cost_penalty,
                     turnover_penalty=config.turnover_penalty,
                     drawdown_penalty=config.drawdown_penalty,
+                    risk_penalty=0.2,
+                    risk_tolerance=1.2,
                     seed=config.seed,
                 )
 
@@ -648,6 +946,8 @@ class Phase5Runner(PhaseRunner):
                     cost_penalty=config.cost_penalty,
                     turnover_penalty=config.turnover_penalty,
                     drawdown_penalty=config.drawdown_penalty,
+                    risk_penalty=0.2,
+                    risk_tolerance=1.2,
                     seed=config.seed,
                 )
 
@@ -685,34 +985,9 @@ class Phase5Runner(PhaseRunner):
 
             else:
                 # ============================================================
-                # ORIGINAL CPU PATH (unchanged)
+                # ORIGINAL CPU PATH
                 # ============================================================
-                cost_model = CostModel(
-                    spread_bps=config.spread_bps,
-                    slippage_bps=config.slippage_bps,
-                    impact_coefficient=config.impact_coefficient,
-                )
-                constraints = PortfolioConstraints(
-                    max_weight=config.max_weight,
-                    min_weight=config.min_weight,
-                    max_turnover=config.max_turnover,
-                    max_exposure=config.max_exposure,
-                )
-                # Map reward_type string to enum
-                reward_type_map = {
-                    "calibrated_alpha": RewardType.CALIBRATED_ALPHA,
-                    "pure_returns": RewardType.PURE_RETURNS,
-                    "alpha_penalized": RewardType.ALPHA_PENALIZED,
-                    "info_ratio": RewardType.INFORMATION_RATIO,
-                    "risk_adjusted": RewardType.RISK_ADJUSTED,
-                }
-                reward_type = reward_type_map.get(config.reward_type, RewardType.CALIBRATED_ALPHA)
-                reward_fn = RewardFunction(
-                    reward_type=reward_type,
-                    cost_penalty_weight=config.cost_penalty,
-                    turnover_penalty_weight=config.turnover_penalty,
-                    drawdown_penalty_weight=config.drawdown_penalty,
-                )
+                # cost_model, constraints, reward_fn already defined above
                 self.logger.info(f"Using reward type: {config.reward_type}")
                 episode_config = EpisodeConfig(
                     random_start=config.random_start,
@@ -726,6 +1001,13 @@ class Phase5Runner(PhaseRunner):
                     self.logger.info(f"Hybrid mode: {config.base_allocator} base + RL tilts (max_tilt={config.max_tilt})")
                 else:
                     self.logger.info("Standard mode: RL outputs absolute weights")
+
+                # Pass soft-mode cluster filter to env (None for hard mode or disabled)
+                _soft_filter = (
+                    cluster_filter_obj
+                    if config.cluster_filter and config.cluster_filter_mode == "soft"
+                    else None
+                )
 
                 train_env = VecTradingEnv(
                     n_envs=n_envs,
@@ -747,6 +1029,8 @@ class Phase5Runner(PhaseRunner):
                     max_tilt=config.max_tilt,
                     # Encoder for dimensionality reduction (critical for stability!)
                     encoder=encoder,
+                    # Soft cluster filter for reward shaping
+                    cluster_filter=_soft_filter,
                 )
                 eval_episode_config = EpisodeConfig(
                     random_start=False,
@@ -793,6 +1077,92 @@ class Phase5Runner(PhaseRunner):
             }
 
         # ==================================================================
+        # STEP 5.3.5: BEHAVIORAL CLONING PRE-TRAINING (optional)
+        # ==================================================================
+        bc_demonstrations = None
+        if config.bc_pretrain:
+            with self.step("5.3.5 Behavioral Cloning Pre-training"):
+                from src.agents.bc_pretrainer import BehavioralCloningPretrainer, BCConfig
+                from src.environment.trading_env import TradingEnvironment, EpisodeConfig as _EC
+
+                bc_cfg = BCConfig(
+                    strategy=config.bc_strategy,
+                    epochs=config.bc_epochs,
+                    lr=config.bc_lr,
+                    batch_size=config.bc_batch_size,
+                    lookback=config.bc_lookback,
+                    max_weight=config.max_weight,
+                    min_weight=config.min_weight,
+                    max_turnover=config.max_turnover,
+                )
+                bc = BehavioralCloningPretrainer(bc_cfg)
+
+                # Try to load Phase 1 features for factor-based strategies
+                features_for_bc = None
+                if config.bc_strategy in ("max_sharpe", "momentum", "vol_targeting"):
+                    features_path = input_dir / 'algo_features.parquet'
+                    if not features_path.exists():
+                        features_path = input_dir / 'algorithms' / 'features.parquet'
+                    if features_path.exists():
+                        features_for_bc = pd.read_parquet(features_path)
+                        self.logger.info(f"Loaded algo features for BC: {features_path.name}")
+                    else:
+                        self.logger.warning(
+                            f"Features file not found for strategy '{config.bc_strategy}'. "
+                            "BC will proceed without features (may fall back to rank-based selection)."
+                        )
+
+                self.logger.info(
+                    f"BC strategy={config.bc_strategy}, "
+                    f"epochs={config.bc_epochs}, lr={config.bc_lr}"
+                )
+                expert_weights = bc.generate_expert_weights(
+                    algo_returns=algo_returns,
+                    train_start=train_dates[0],
+                    train_end=train_dates[1],
+                    features=features_for_bc,
+                )
+
+                # Create a single non-vectorized env for rollout collection
+                bc_episode_cfg = _EC(
+                    random_start=False,
+                    episode_length=None,  # run full training window
+                )
+                bc_env = TradingEnvironment(
+                    algo_returns=algo_returns,
+                    benchmark_weights=benchmark_weights,
+                    cost_model=cost_model,
+                    constraints=constraints,
+                    reward_function=reward_fn,
+                    initial_capital=config.initial_capital,
+                    rebalance_frequency=config.rebalance_frequency,
+                    train_start=train_dates[0],
+                    train_end=train_dates[1],
+                    reward_scale=config.reward_scale,
+                    episode_config=bc_episode_cfg,
+                    encoder=encoder,
+                    hybrid_mode=config.hybrid_mode,
+                    base_allocator=config.base_allocator,
+                    max_tilt=config.max_tilt,
+                )
+                bc_demonstrations = bc.collect_demonstrations(
+                    env=bc_env,
+                    expert_weights=expert_weights,
+                    encoder=encoder,
+                    hybrid_mode=config.hybrid_mode,
+                    max_tilt=config.max_tilt,
+                )
+                results['bc_pretrain'] = {
+                    'strategy': config.bc_strategy,
+                    'n_demonstrations': int(bc_demonstrations[0].shape[0])
+                    if bc_demonstrations[0].ndim > 0
+                    else 0,
+                    'epochs': config.bc_epochs,
+                }
+                del bc_env
+                gc.collect()
+
+        # ==================================================================
         # STEP 5.4: TRAIN AGENTS
         # ==================================================================
         agents_to_train = ['ppo', 'sac', 'td3'] if args.agent == 'all' else [args.agent]
@@ -811,6 +1181,8 @@ class Phase5Runner(PhaseRunner):
                     off_policy_batch_size=off_policy_batch_size,
                     buffer_size=buffer_size,
                     gradient_steps=gradient_steps,
+                    bc_demonstrations=bc_demonstrations,
+                    bc_config=config if config.bc_pretrain else None,
                 )
                 results['agents_trained'].append(agent_results)
 
@@ -833,6 +1205,8 @@ class Phase5Runner(PhaseRunner):
                 "use_encoder": config.use_encoder,
                 "encoder_type": "family" if config.use_family_encoder else "pca",
                 "n_pca_components": config.n_pca_components,
+                "input_dir": str(input_dir.resolve()),
+                "phase2_cluster_selection": results.get("phase2_cluster_selection"),
                 "reward": {
                     "scale": config.reward_scale,
                     "cost_penalty": config.cost_penalty,
@@ -881,6 +1255,8 @@ class Phase5Runner(PhaseRunner):
         off_policy_batch_size: int = 256,
         buffer_size: int = 100_000,
         gradient_steps: int = 1,
+        bc_demonstrations=None,
+        bc_config=None,
     ) -> dict:
         """Train a single agent."""
         from src.agents.ppo_agent import PPOAllocator
@@ -942,6 +1318,33 @@ class Phase5Runner(PhaseRunner):
 
         self.logger.info(f"Created {agent_name.upper()} agent")
         self.logger.info(f"Hyperparameters: {agent.get_hyperparameters()}")
+
+        # Behavioral Cloning warm-start (runs before RL training)
+        bc_results = None
+        if bc_demonstrations is not None and bc_config is not None:
+            obs_arr, act_arr = bc_demonstrations
+            if len(obs_arr) > 0:
+                from src.agents.bc_pretrainer import BehavioralCloningPretrainer, BCConfig
+                bc_cfg = BCConfig(
+                    strategy=bc_config.bc_strategy,
+                    epochs=bc_config.bc_epochs,
+                    lr=bc_config.bc_lr,
+                    batch_size=bc_config.bc_batch_size,
+                )
+                bc = BehavioralCloningPretrainer(bc_cfg)
+                self.logger.info(
+                    f"Starting BC pre-training ({bc_config.bc_epochs} epochs, "
+                    f"lr={bc_config.bc_lr}, strategy={bc_config.bc_strategy})"
+                )
+                bc_results = bc.pretrain(agent.model, bc_demonstrations)
+                self.logger.info(
+                    f"BC pre-training done: "
+                    f"final_loss={bc_results['loss_history'][-1]:.6f}"
+                    if bc_results.get('loss_history')
+                    else "BC pre-training done (no loss recorded)"
+                )
+            else:
+                self.logger.warning("BC demonstrations empty — skipping BC pre-training.")
 
         # Resume if checkpoint provided
         if resume_path:
@@ -1025,8 +1428,16 @@ class Phase5Runner(PhaseRunner):
 
     def _load_data(self, input_dir: Path):
         """Load Phase 1 data."""
-        # Load returns matrix - try new path first, then legacy
-        returns_path = self.dp.algorithms.returns
+        # Load returns matrix - honor input_dir override first
+        if input_dir != self.dp.processed.root:
+            candidates = [
+                input_dir / 'algorithms' / 'returns.parquet',
+                input_dir / 'algo_returns.parquet',
+                input_dir / 'returns.parquet',
+            ]
+            returns_path = next((p for p in candidates if p.exists()), self.dp.algorithms.returns)
+        else:
+            returns_path = self.dp.algorithms.returns
         if not returns_path.exists():
             returns_path = input_dir / 'algo_returns.parquet'
         if not returns_path.exists():
@@ -1040,7 +1451,15 @@ class Phase5Runner(PhaseRunner):
         self.logger.info(f"Loaded returns: {algo_returns.shape}")
 
         # Load benchmark weights
-        weights_path = self.dp.benchmark.weights
+        if input_dir != self.dp.processed.root:
+            candidates = [
+                input_dir / 'benchmark' / 'weights.parquet',
+                input_dir / 'benchmark_weights.parquet',
+                input_dir / 'weights.parquet',
+            ]
+            weights_path = next((p for p in candidates if p.exists()), self.dp.benchmark.weights)
+        else:
+            weights_path = self.dp.benchmark.weights
         if not weights_path.exists():
             weights_path = input_dir / 'benchmark_weights.parquet'
 
@@ -1054,7 +1473,15 @@ class Phase5Runner(PhaseRunner):
             self.logger.info(f"Loaded benchmark weights: {benchmark_weights.shape}")
 
         # Load benchmark returns
-        bench_path = self.dp.benchmark.daily_returns
+        if input_dir != self.dp.processed.root:
+            candidates = [
+                input_dir / 'benchmark' / 'daily_returns.csv',
+                input_dir / 'benchmark_daily_returns.csv',
+                input_dir / 'daily_returns.csv',
+            ]
+            bench_path = next((p for p in candidates if p.exists()), self.dp.benchmark.daily_returns)
+        else:
+            bench_path = self.dp.benchmark.daily_returns
         if not bench_path.exists():
             bench_path = input_dir / 'benchmark_daily_returns.csv'
 

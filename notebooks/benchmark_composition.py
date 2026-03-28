@@ -31,6 +31,8 @@ import argparse
 import warnings
 warnings.filterwarnings('ignore')
 
+from notebook_paths import default_output_dir, notebook_data_path, raw_benchmark_path
+
 
 # ============================================================
 # PHASE DEFINITIONS
@@ -240,11 +242,13 @@ def holding_period_profile(trades_phase):
 
 def main():
     parser = argparse.ArgumentParser(description='Benchmark composition by phase')
-    parser.add_argument('--trades', required=True)
-    parser.add_argument('--inference', required=True, help='asset_inference_all.csv')
-    parser.add_argument('--metrics', required=True, help='metrics_all.csv')
-    parser.add_argument('--clusters', default=None, help='clusters.csv')
-    parser.add_argument('--output', default='results/composition')
+    parser.add_argument('--trades', default=str(raw_benchmark_path('trades_benchmark.csv')))
+    parser.add_argument('--inference', default=str(notebook_data_path('pipeline', 'asset_inference_all.csv')),
+                        help='asset_inference_all.csv')
+    parser.add_argument('--metrics', default=str(notebook_data_path('pipeline', 'metrics_all.csv')),
+                        help='metrics_all.csv')
+    parser.add_argument('--clusters', default=str(notebook_data_path('clusters', 'clusters.csv')), help='clusters.csv')
+    parser.add_argument('--output', default=str(default_output_dir('composition')))
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
 

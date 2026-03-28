@@ -24,6 +24,8 @@ import argparse
 import warnings
 warnings.filterwarnings('ignore')
 
+from notebook_paths import default_output_dir, notebook_data_path, raw_benchmark_path
+
 
 def load_actual(monthly_path):
     """Load actual benchmark."""
@@ -158,13 +160,13 @@ def build_monthly_comparison(actual, methods_dict):
 def main():
     parser = argparse.ArgumentParser(
         description='Compare Dietz reconstruction methods')
-    parser.add_argument('--dietz_daily', required=True,
+    parser.add_argument('--dietz_daily', default=str(notebook_data_path('dietz', 'dietz_reconstruction_daily.csv')),
                        help='dietz_reconstruction_daily.csv')
-    parser.add_argument('--nocf_daily', default=None,
+    parser.add_argument('--nocf_daily', default=str(notebook_data_path('reconstruction', 'reconstruction_daily.csv')),
                        help='reconstruction_daily.csv (no-cashflow, for comparison)')
-    parser.add_argument('--monthly', required=True,
+    parser.add_argument('--monthly', default=str(raw_benchmark_path('benchmark_monthly_returns.csv')),
                        help='benchmark_monthly_returns.csv')
-    parser.add_argument('--output', default='results/dietz/comparison')
+    parser.add_argument('--output', default=str(default_output_dir('dietz', 'comparison')))
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
 

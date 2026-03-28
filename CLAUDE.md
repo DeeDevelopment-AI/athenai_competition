@@ -85,10 +85,15 @@ rl-meta-allocator/
 ├── notebooks/                         # 01-06: EDA → benchmark → regimes → baselines → RL → eval
 ├── scripts/                           # run_phase1.py, run_phase3.py, etc.
 ├── tests/
-└── outputs/                           # Experiment outputs (see Output Organization)
-    ├── baselines/                     # Phase 3: trials/, figures/, SUMMARY.md
-    ├── rl_training/                   # Phase 5: checkpoints/, logs/, figures/
-    └── evaluation/                    # Phase 6: walk_forward/, comparison/, figures/
+└── outputs/                           # ALL phase reports + experiment outputs (see Output Organization)
+    ├── data_pipeline/                 # Phase 1: PHASE1_SUMMARY.md, results.json, metrics.json
+    ├── analysis/                      # Phase 2: PHASE2_SUMMARY.md, results.json, metrics.json
+    ├── baselines/                     # Phase 3: trials/, figures/, PHASE3_SUMMARY.md
+    ├── environment/                   # Phase 4: PHASE4_SUMMARY.md
+    ├── rl_training/                   # Phase 5: {run_id}/checkpoints/, latest_run.txt
+    ├── evaluation/                    # Phase 6: {run_id}/walk_forward/, latest_run.txt
+    ├── swarm_pso/                     # Phase 7:  {run_id}/weights/, backtests/, latest_run.txt
+    └── swarm_aco/                     # Phase 7A: {run_id}/weights/, backtests/, latest_run.txt
 ```
 
 ---
@@ -139,22 +144,39 @@ results.to_csv(op.baselines.trials_csv)
 | `analysis/regimes/probabilities.parquet` | Probabilidades HMM | Phase 2 |
 | `features/cross_sectional.parquet` | Features cross-sectional | Phase 2 |
 | `features/regime.parquet` | Features de régimen | Phase 2 |
-| `reports/phase1/SUMMARY.md` | Reporte Phase 1 | Phase 1 |
-| `reports/phase2/results.json` | Resultados Phase 2 | Phase 2 |
 
 ### Estructura de `outputs/`
 
 | Path | Contenido | Generado por |
 |------|-----------|--------------|
+| `data_pipeline/PHASE1_SUMMARY.md` | Reporte Phase 1 | Phase 1 |
+| `data_pipeline/phase1_results.json` | Resultados Phase 1 | Phase 1 |
+| `data_pipeline/phase1_metrics.json` | Métricas de performance Phase 1 | Phase 1 |
+| `analysis/PHASE2_SUMMARY.md` | Reporte Phase 2 | Phase 2 |
+| `analysis/phase2_results.json` | Resultados Phase 2 | Phase 2 |
+| `analysis/phase2_metrics.json` | Métricas de performance Phase 2 | Phase 2 |
 | `baselines/trials/results.csv` | Resultados de todos los trials | Phase 3 |
 | `baselines/figures/` | Visualizaciones de baselines | Phase 3 |
-| `baselines/SUMMARY.md` | Reporte de baselines | Phase 3 |
-| `rl_training/checkpoints/` | Model checkpoints | Phase 5 |
-| `rl_training/logs/` | Training logs (tensorboard) | Phase 5 |
-| `rl_training/figures/` | Training curves | Phase 5 |
-| `evaluation/walk_forward/` | Resultados walk-forward | Phase 6 |
-| `evaluation/comparison/` | Comparación final | Phase 6 |
-| `evaluation/figures/` | Gráficos finales | Phase 6 |
+| `baselines/PHASE3_SUMMARY.md` | Reporte de baselines | Phase 3 |
+| `environment/PHASE4_SUMMARY.md` | Reporte validación entorno | Phase 4 |
+| `rl_training/{run_id}/checkpoints/{agent}/` | Model checkpoints (un dir por run) | Phase 5 |
+| `rl_training/{run_id}/logs/{agent}/` | Training logs (un dir por run) | Phase 5 |
+| `rl_training/{run_id}/run_info.json` | Metadatos del run | Phase 5 |
+| `rl_training/{run_id}/PHASE5_SUMMARY.md` | Reporte del run | Phase 5 |
+| `rl_training/latest_run.txt` | Puntero al run más reciente | Phase 5 |
+| `evaluation/{run_id}/walk_forward/` | Resultados walk-forward (un dir por run) | Phase 6 |
+| `evaluation/{run_id}/PHASE6_SUMMARY.md` | Reporte del run | Phase 6 |
+| `evaluation/latest_run.txt` | Puntero al run más reciente | Phase 6 |
+| `swarm_pso/{run_id}/weights/` | Pesos PSO (un dir por run) | Phase 7 |
+| `swarm_pso/{run_id}/backtests/` | Retornos del backtest | Phase 7 |
+| `swarm_pso/{run_id}/reports/` | Summary y comparison JSON | Phase 7 |
+| `swarm_pso/{run_id}/PHASE7_SUMMARY.md` | Reporte del run | Phase 7 |
+| `swarm_pso/latest_run.txt` | Puntero al run más reciente | Phase 7 |
+| `swarm_aco/{run_id}/weights/` | Pesos ACO (un dir por run) | Phase 7A |
+| `swarm_aco/{run_id}/backtests/` | Retornos del backtest | Phase 7A |
+| `swarm_aco/{run_id}/reports/` | Summary y comparison JSON | Phase 7A |
+| `swarm_aco/{run_id}/PHASE7A_SUMMARY.md` | Reporte del run | Phase 7A |
+| `swarm_aco/latest_run.txt` | Puntero al run más reciente | Phase 7A |
 
 ### Best Practices de Data
 

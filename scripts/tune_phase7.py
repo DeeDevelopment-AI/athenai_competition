@@ -29,9 +29,9 @@ Temporal Split Options:
   --validation-ratio F          Validation ratio for temporal split (default: 0.20)
 
 Selection Criteria:
-  --selection-objective S       How to choose best trial (default: blended_excess_return)
-                                Options: validation_excess_return, validation_sharpe,
-                                         blended_excess_return, blended_sharpe
+  --selection-objective S       How to choose best trial (default: blended_sharpe)
+                                Options: validation_return, validation_sharpe,
+                                         blended_return, blended_sharpe
   --validation-weight F         Weight on validation metrics (default: 0.70)
   --test-weight F               Weight on test metrics (default: 0.30)
   --max-validation-drawdown F   Max allowed validation drawdown (default: 0.10)
@@ -83,8 +83,8 @@ class Phase7TuningRunner(PhaseRunner):
         parser.add_argument(
             "--selection-objective",
             type=str,
-            default="blended_excess_return",
-            choices=["validation_excess_return", "validation_sharpe", "blended_excess_return", "blended_sharpe"],
+            default="blended_sharpe",
+            choices=["validation_return", "validation_sharpe", "blended_return", "blended_sharpe"],
             help="How to choose the best trial",
         )
 
@@ -142,14 +142,15 @@ class Phase7TuningRunner(PhaseRunner):
                     "trial_name": candidate["name"],
                     "selection_factor": candidate["selection_factor"],
                     "selection_score": selection_score,
-                    "validation_excess_return": float(validation.get("excess_return", 0.0)),
                     "validation_annualized_return": float(validation.get("annualized_return", 0.0)),
                     "validation_sharpe_ratio": float(validation.get("sharpe_ratio", 0.0)),
                     "validation_max_drawdown": float(validation.get("max_drawdown", 0.0)),
-                    "validation_benchmark_annualized_return": float(validation.get("benchmark_annualized_return", 0.0)),
+                    "validation_benchmark_annualized_volatility": float(validation.get("benchmark_annualized_volatility", 0.0)),
+                    "validation_benchmark_max_drawdown": float(validation.get("benchmark_max_drawdown", 0.0)),
                     "test_annualized_return": float(test.get("annualized_return", 0.0)),
                     "test_sharpe_ratio": float(test.get("sharpe_ratio", 0.0)),
-                    "test_benchmark_annualized_return": float(test.get("benchmark_annualized_return", 0.0)),
+                    "test_benchmark_annualized_volatility": float(test.get("benchmark_annualized_volatility", 0.0)),
+                    "test_benchmark_max_drawdown": float(test.get("benchmark_max_drawdown", 0.0)),
                     **candidate["config"],
                     **result.summary,
                 }
@@ -161,7 +162,7 @@ class Phase7TuningRunner(PhaseRunner):
         tuning_dir = output_dir / "tuning"
         tuning_dir.mkdir(parents=True, exist_ok=True)
         trials_df = pd.DataFrame(trial_rows).sort_values(
-            by=["selection_score", "validation_excess_return", "test_annualized_return"],
+            by=["selection_score", "validation_sharpe_ratio", "test_annualized_return"],
             ascending=[False, False, False],
         )
         trials_path = tuning_dir / "trials.csv"
@@ -272,30 +273,45 @@ class Phase7TuningRunner(PhaseRunner):
         test_drawdown = abs(float(test.get("max_drawdown", 0.0)))
         test_penalty = max(0.0, test_drawdown - max_test_drawdown) * 5.0
 
-        validation_benchmark_return = float(validation.get("benchmark_annualized_return", 0.0))
-        test_benchmark_return = float(test.get("benchmark_annualized_return", 0.0))
-        validation_excess = float(validation.get("annualized_return", 0.0)) - validation_benchmark_return
-        test_excess = float(test.get("annualized_return", 0.0)) - test_benchmark_return
+        validation_return = float(validation.get("annualized_return", 0.0))
+        test_return = float(test.get("annualized_return", 0.0))
         validation_sharpe = float(validation.get("sharpe_ratio", 0.0))
         test_sharpe = float(test.get("sharpe_ratio", 0.0))
+        validation_risk_penalty = self._risk_alignment_penalty(validation)
+        test_risk_penalty = self._risk_alignment_penalty(test)
 
         if objective == "validation_sharpe":
-            return validation_sharpe - validation_penalty
-        if objective == "validation_excess_return":
-            return validation_excess - validation_penalty
+            return validation_sharpe - validation_penalty - validation_risk_penalty
+        if objective == "validation_return":
+            return validation_return - validation_penalty - validation_risk_penalty
         if objective == "blended_sharpe":
             return (
                 validation_weight * validation_sharpe
                 + test_weight * test_sharpe
                 - validation_penalty
                 - test_penalty
+                - validation_weight * validation_risk_penalty
+                - test_weight * test_risk_penalty
             )
         return (
-            validation_weight * validation_excess
-            + test_weight * test_excess
+            validation_weight * validation_return
+            + test_weight * test_return
             - validation_penalty
             - test_penalty
+            - validation_weight * validation_risk_penalty
+            - test_weight * test_risk_penalty
         )
+
+    def _risk_alignment_penalty(self, metrics: dict) -> float:
+        benchmark_vol = float(metrics.get("benchmark_annualized_volatility", 0.0))
+        benchmark_dd = abs(float(metrics.get("benchmark_max_drawdown", 0.0)))
+        portfolio_vol = float(metrics.get("annualized_volatility", 0.0))
+        portfolio_dd = abs(float(metrics.get("max_drawdown", 0.0)))
+        if benchmark_vol <= 0 and benchmark_dd <= 0:
+            return 0.0
+        vol_gap = abs(portfolio_vol - benchmark_vol)
+        dd_gap = abs(portfolio_dd - benchmark_dd)
+        return 2.0 * vol_gap + 3.0 * dd_gap
 
     def _candidate_configs(self, cpu_only: bool) -> list[dict]:
         use_gpu = not cpu_only
@@ -623,22 +639,22 @@ class Phase7TuningRunner(PhaseRunner):
             f"- Name: {best_row['trial_name']}",
             f"- Selection factor: {best_row['selection_factor']}",
             f"- Validation annualized return: {best_row['validation_annualized_return']:.2%}",
-            f"- Validation benchmark annualized return: {best_row['validation_benchmark_annualized_return']:.2%}",
+            f"- Validation benchmark volatility reference: {best_row['validation_benchmark_annualized_volatility']:.2%}",
             f"- Validation Sharpe: {best_row['validation_sharpe_ratio']:.3f}",
             f"- Validation max drawdown: {best_row['validation_max_drawdown']:.2%}",
             f"- Test annualized return: {best_row['test_annualized_return']:.2%}",
             f"- Test Sharpe: {best_row['test_sharpe_ratio']:.3f}",
-            f"- Test benchmark annualized return: {best_row['test_benchmark_annualized_return']:.2%}",
+            f"- Test benchmark volatility reference: {best_row['test_benchmark_annualized_volatility']:.2%}",
             "",
             "## Top Trials",
             "",
-            "| Trial | Factor | Selection Score | Val Return | Val Bench | Val Sharpe | Test Return | Test Sharpe |",
-            "|------|--------|-----------------|------------|-----------|------------|-------------|-------------|",
+            "| Trial | Factor | Selection Score | Val Return | Val Vol Ref | Val Sharpe | Test Return | Test Sharpe |",
+            "|------|--------|-----------------|------------|-------------|------------|-------------|-------------|",
         ]
         for _, row in top_rows.iterrows():
             lines.append(
                 f"| {row['trial_name']} | {row['selection_factor']} | {row['selection_score']:.4f} | "
-                f"{row['validation_annualized_return']:.2%} | {row['validation_benchmark_annualized_return']:.2%} | "
+                f"{row['validation_annualized_return']:.2%} | {row['validation_benchmark_annualized_volatility']:.2%} | "
                 f"{row['validation_sharpe_ratio']:.3f} | {row['test_annualized_return']:.2%} | {row['test_sharpe_ratio']:.3f} |"
             )
         lines.append("")

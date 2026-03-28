@@ -32,6 +32,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from notebook_paths import default_output_dir, notebook_data_path, raw_benchmark_path
 try:
     from algo_pipeline import load_algorithm_csv, trim_dead_tail
 except:
@@ -284,10 +285,13 @@ def build_monthly_return_table(df, best_method):
 
 def main():
     parser = argparse.ArgumentParser(description='Deep benchmark comparison analysis')
-    parser.add_argument('--daily', required=True, help='reconstruction_daily.csv')
-    parser.add_argument('--monthly', default=None, help='benchmark_monthly_returns.csv')
-    parser.add_argument('--yearly', default=None, help='benchmark_yearly_returns.csv')
-    parser.add_argument('--output', default='results/comparison', help='Output directory')
+    parser.add_argument('--daily', default=str(notebook_data_path('reconstruction', 'reconstruction_daily.csv')),
+                        help='reconstruction_daily.csv')
+    parser.add_argument('--monthly', default=str(raw_benchmark_path('benchmark_monthly_returns.csv')),
+                        help='benchmark_monthly_returns.csv')
+    parser.add_argument('--yearly', default=str(raw_benchmark_path('benchmark_yearly_returns.csv')),
+                        help='benchmark_yearly_returns.csv')
+    parser.add_argument('--output', default=str(default_output_dir('comparison')), help='Output directory')
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)

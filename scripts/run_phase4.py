@@ -82,6 +82,11 @@ class Phase4Runner(PhaseRunner):
     phase_name = "Phase 4: Environment Validation"
     phase_number = 4
 
+    def _run_tag(self) -> str:
+        freq = getattr(self.args, 'rebalance_freq', 'weekly')
+        mode = "full" if getattr(self.args, 'full', False) else "std"
+        return f"{freq}_{mode}"
+
     def add_arguments(self, parser: argparse.ArgumentParser):
         """Add Phase 4 specific arguments."""
         parser.add_argument(
@@ -249,8 +254,8 @@ class Phase4Runner(PhaseRunner):
             from src.environment.reward import RewardFunction, RewardType
 
             reward_types = [
-                RewardType.ALPHA_PENALIZED,
-                RewardType.INFORMATION_RATIO,
+                RewardType.ABSOLUTE_RETURNS,
+                RewardType.RISK_CALIBRATED_RETURNS,
                 RewardType.RISK_ADJUSTED,
                 RewardType.DIVERSIFIED,
             ]

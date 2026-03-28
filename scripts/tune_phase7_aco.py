@@ -44,9 +44,9 @@ Walk-Forward Options (when --selection-scheme walk_forward):
   --max-folds N                 Maximum number of folds
 
 Selection Criteria:
-  --selection-objective S       How to choose best trial (default: validation_excess_return)
-                                Options: validation_sharpe, validation_excess_return,
-                                         blended_excess_return, blended_sharpe
+  --selection-objective S       How to choose best trial (default: validation_sharpe)
+                                Options: validation_sharpe, validation_return,
+                                         blended_return, blended_sharpe
   --validation-weight F         Weight on validation metrics (default: 0.70)
   --test-weight F               Weight on test metrics (default: 0.30)
   --max-validation-drawdown F   Max allowed validation drawdown (default: 0.12)
@@ -114,11 +114,8 @@ SPLIT_METRIC_KEYS = (
     "sortino_ratio",
     "calmar_ratio",
     "max_drawdown",
-    "tracking_error",
-    "information_ratio",
-    "alpha_vs_benchmark",
-    "beta_vs_benchmark",
-    "benchmark_annualized_return",
+    "benchmark_annualized_volatility",
+    "benchmark_max_drawdown",
 )
 
 
@@ -183,8 +180,8 @@ class Phase7ACOTuningRunner(PhaseRunner):
         parser.add_argument(
             "--selection-objective",
             type=str,
-            default="validation_excess_return",
-            choices=["validation_sharpe", "validation_excess_return", "blended_excess_return", "blended_sharpe"],
+            default="validation_sharpe",
+            choices=["validation_sharpe", "validation_return", "blended_return", "blended_sharpe"],
         )
         parser.add_argument(
             "--allow-test-in-selection",
@@ -702,10 +699,8 @@ class Phase7ACOTuningRunner(PhaseRunner):
             "sortino_ratio",
             "calmar_ratio",
             "max_drawdown",
-            "tracking_error",
-            "information_ratio",
-            "alpha_vs_benchmark",
-            "beta_vs_benchmark",
+            "benchmark_annualized_volatility",
+            "benchmark_max_drawdown",
         ]
         rows = []
         for metric in metrics:
@@ -755,20 +750,45 @@ class Phase7ACOTuningRunner(PhaseRunner):
         test_drawdown = abs(float(test.get("max_drawdown", 0.0)))
         test_penalty = max(0.0, test_drawdown - max_test_drawdown) * 5.0
 
-        validation_benchmark_return = float(validation.get("benchmark_annualized_return", 0.0))
-        test_benchmark_return = float(test.get("benchmark_annualized_return", 0.0))
-        validation_excess = float(validation.get("annualized_return", 0.0)) - validation_benchmark_return
-        test_excess = float(test.get("annualized_return", 0.0)) - test_benchmark_return
+        validation_return = float(validation.get("annualized_return", 0.0))
+        test_return = float(test.get("annualized_return", 0.0))
         validation_sharpe = float(validation.get("sharpe_ratio", 0.0))
         test_sharpe = float(test.get("sharpe_ratio", 0.0))
+        validation_risk_penalty = self._risk_alignment_penalty(validation)
+        test_risk_penalty = self._risk_alignment_penalty(test)
 
         if objective == "validation_sharpe":
-            return validation_sharpe - validation_penalty
-        if objective == "validation_excess_return":
-            return validation_excess - validation_penalty
-        if objective == "blended_excess_return":
-            return validation_weight * validation_excess + test_weight * test_excess - validation_penalty - test_penalty
-        return validation_weight * validation_sharpe + test_weight * test_sharpe - validation_penalty - test_penalty
+            return validation_sharpe - validation_penalty - validation_risk_penalty
+        if objective == "validation_return":
+            return validation_return - validation_penalty - validation_risk_penalty
+        if objective == "blended_return":
+            return (
+                validation_weight * validation_return
+                + test_weight * test_return
+                - validation_penalty
+                - test_penalty
+                - validation_weight * validation_risk_penalty
+                - test_weight * test_risk_penalty
+            )
+        return (
+            validation_weight * validation_sharpe
+            + test_weight * test_sharpe
+            - validation_penalty
+            - test_penalty
+            - validation_weight * validation_risk_penalty
+            - test_weight * test_risk_penalty
+        )
+
+    def _risk_alignment_penalty(self, metrics: dict) -> float:
+        benchmark_vol = float(metrics.get("benchmark_annualized_volatility", 0.0))
+        benchmark_dd = abs(float(metrics.get("benchmark_max_drawdown", 0.0)))
+        portfolio_vol = float(metrics.get("annualized_volatility", 0.0))
+        portfolio_dd = abs(float(metrics.get("max_drawdown", 0.0)))
+        if benchmark_vol <= 0 and benchmark_dd <= 0:
+            return 0.0
+        vol_gap = abs(portfolio_vol - benchmark_vol)
+        dd_gap = abs(portfolio_dd - benchmark_dd)
+        return 2.0 * vol_gap + 3.0 * dd_gap
 
     def _build_report(
         self,

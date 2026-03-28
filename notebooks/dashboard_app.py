@@ -23,6 +23,8 @@ import os
 import sys
 import argparse
 
+from notebook_paths import NOTEBOOK_DATA_DIR
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -35,7 +37,7 @@ st.set_page_config(
 )
 
 # Parse results directory from command line
-DEFAULT_DIR = "./results"
+DEFAULT_DIR = str(NOTEBOOK_DATA_DIR)
 for i, arg in enumerate(sys.argv):
     if arg == "--results" and i + 1 < len(sys.argv):
         DEFAULT_DIR = sys.argv[i + 1]

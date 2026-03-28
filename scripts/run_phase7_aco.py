@@ -65,7 +65,7 @@ Advanced Options:
   --train-ratio F               Train ratio for temporal split (default: 0.60)
   --validation-ratio F          Validation ratio for temporal split (default: 0.20)
   --seed N                      Random seed (default: 42)
-  --cpu-only                    Compatibility flag (ACO runs on CPU)
+  --cpu-only                    Force CPU execution even if CUDA is available
   --input-dir PATH              Override Phase 1 processed directory
   --analysis-dir PATH           Override Phase 2 analysis directory
 """
@@ -90,10 +90,21 @@ class Phase7ACORunner(Phase7Runner):
     phase_name = "Phase 7A: Ant Colony Meta-Allocator"
     phase_number = 8
 
+    def _run_tag(self) -> str:
+        if not self.args:
+            return ""
+        ants = getattr(self.args, 'ants', 96)
+        iterations = getattr(self.args, 'iterations', 60)
+        factors = getattr(self.args, 'selection_factor', ['rolling_sharpe_21d'])
+        factor = factors[0] if isinstance(factors, list) else factors
+        return f"aco_{ants}a_{iterations}i_{factor}"
+
     def get_output_dir(self) -> Path:
         if self.args and self.args.output_dir:
             return Path(self.args.output_dir)
-        return self.op.root / "swarm_allocator_aco"
+        root = self.op.swarm_aco.root
+        run_id = self._run_id or self._make_run_id()
+        return root / run_id
 
     def add_arguments(self, parser: argparse.ArgumentParser):
         parser.add_argument("--sample", type=int, default=None, help="Use only N algorithms")
@@ -153,10 +164,28 @@ class Phase7ACORunner(Phase7Runner):
         parser.add_argument(
             "--cpu-only",
             action="store_true",
-            help="Compatibility flag; the ACO optimizer already runs on CPU",
+            help="Force CPU execution even if CUDA is available",
         )
         parser.add_argument("--input-dir", type=str, default=None, help="Override Phase 1 processed directory")
         parser.add_argument("--analysis-dir", type=str, default=None, help="Override Phase 2 analysis directory")
+        parser.add_argument("--phase2-cluster-filter", action="store_true", help="Restrict the ACO universe to the best Phase 2 clusters")
+        parser.add_argument(
+            "--phase2-cluster-source",
+            type=str,
+            default="temporal_cumulative",
+            choices=["behavioral_family", "temporal_cumulative", "temporal_weekly", "temporal_monthly"],
+        )
+        parser.add_argument(
+            "--phase2-cluster-score-mode",
+            type=str,
+            default="return_low_vol",
+            choices=["return_low_vol", "return", "sharpe", "sortino"],
+        )
+        parser.add_argument("--phase2-cluster-top-k", type=int, default=1)
+        parser.add_argument("--phase2-cluster-min-size", type=int, default=20)
+        parser.add_argument("--phase2-cluster-min-return", type=float, default=0.01)
+        parser.add_argument("--phase2-cluster-max-vol", type=float, default=0.12)
+        parser.add_argument("--phase2-cluster-full-history", action="store_true")
         parser.add_argument(
             "--temporal-split",
             type=str,
@@ -175,7 +204,10 @@ class Phase7ACORunner(Phase7Runner):
 
         input_dir = Path(args.input_dir) if args.input_dir else self.dp.processed.root
         analysis_dir = Path(args.analysis_dir) if args.analysis_dir else self.dp.processed.analysis.root
+
+        # Output dir and run_id are managed by PhaseRunner.execute() via _run_tag()
         output_dir = self.get_output_dir()
+        self.logger.info(f"Swarm ACO run ID: {self._run_id or output_dir.name}")
 
         with self.step("7A.1 Load Phase 1 Artifacts"):
             sampled_cols = self._resolve_sampled_algorithms(input_dir, args.sample)
@@ -192,6 +224,27 @@ class Phase7ACORunner(Phase7Runner):
             results["artifacts"]["features_available"] = features is not None
             results["artifacts"]["benchmark_returns_available"] = benchmark_returns is not None
             results["artifacts"]["benchmark_weights_available"] = benchmark_weights is not None
+
+        if args.phase2_cluster_filter:
+            with self.step("7A.1.5 Apply Phase 2 Cluster Universe"):
+                algo_returns, features, benchmark_weights, cluster_selection = self._apply_phase2_cluster_universe(
+                    algo_returns=algo_returns,
+                    features=features,
+                    benchmark_weights=benchmark_weights,
+                    analysis_dir=analysis_dir,
+                    output_dir=output_dir,
+                    source=args.phase2_cluster_source,
+                    score_mode=args.phase2_cluster_score_mode,
+                    top_k=args.phase2_cluster_top_k,
+                    min_size=args.phase2_cluster_min_size,
+                    min_return=args.phase2_cluster_min_return,
+                    max_vol=args.phase2_cluster_max_vol,
+                    latest_only=not args.phase2_cluster_full_history,
+                )
+                results["phase2_cluster_selection"] = cluster_selection
+                results["artifacts"]["returns_shape"] = list(algo_returns.shape)
+                results["artifacts"]["features_available"] = features is not None
+                results["artifacts"]["benchmark_weights_available"] = benchmark_weights is not None
 
         with self.step("7A.2 Load Optional Phase 2 Artifacts"):
             family_labels = self._load_optional_family_labels(
@@ -265,7 +318,7 @@ class Phase7ACORunner(Phase7Runner):
                 selection_mode=args.selection_mode,
                 normalize_objective_metrics=args.normalize_objective_metrics,
                 seed=args.seed,
-                use_gpu=False,
+                use_gpu=not args.cpu_only,
             )
             results["config"] = asdict(config)
 
@@ -380,19 +433,13 @@ weight optimizer with an ant-colony search over discrete allocation buckets.
 | Objective | {summary.get("objective_name", "aco_sharpe_balanced")} |
 | Device | {summary.get("device", "cpu")} |
 
-## Benchmark Comparison
+## Risk Reference
 
-| Metric | ACO | Benchmark | Delta |
-|--------|-----|-----------|-------|
-| Total Return | {summary.get("portfolio_total_return", 0):.2%} | {summary.get("benchmark_total_return", 0):.2%} | {summary.get("excess_total_return", 0):.2%} |
-| Annualized Return | {summary.get("annualized_return", 0):.2%} | {summary.get("benchmark_annualized_return", 0):.2%} | {(summary.get("annualized_return", 0) - summary.get("benchmark_annualized_return", 0)):.2%} |
-| Sharpe Ratio | {summary.get("sharpe_ratio", 0):.3f} | {summary.get("benchmark_sharpe_ratio", 0):.3f} | {(summary.get("sharpe_ratio", 0) - summary.get("benchmark_sharpe_ratio", 0)):.3f} |
-| Max Drawdown | {summary.get("max_drawdown", 0):.2%} | {summary.get("benchmark_max_drawdown", 0):.2%} | {(summary.get("max_drawdown", 0) - summary.get("benchmark_max_drawdown", 0)):.2%} |
-
-## Headline
-
-- Beat benchmark by total return: {comparison.get("beat_benchmark_total_return", False)}
-- Daily hit rate vs benchmark: {comparison.get("daily_hit_rate_vs_benchmark", 0):.2%}
+| Metric | ACO | Benchmark Reference | Gap |
+|--------|-----|---------------------|-----|
+| Annualized Volatility | {summary.get("annualized_volatility", 0):.2%} | {summary.get("benchmark_annualized_volatility", 0):.2%} | {comparison.get("volatility_gap", 0):.2%} |
+| Max Drawdown | {summary.get("max_drawdown", 0):.2%} | {summary.get("benchmark_max_drawdown", 0):.2%} | {comparison.get("drawdown_gap", 0):.2%} |
+| Risk Alignment Score | {comparison.get("risk_alignment_score", 0):.3f} | n/a | n/a |
 
 ## Temporal Split
 
@@ -405,7 +452,8 @@ weight optimizer with an ant-colony search over discrete allocation buckets.
                     f"{split.get('start_date', 'n/a')} -> {split.get('end_date', 'n/a')} | "
                     f"return={split.get('annualized_return', 0):.2%} | "
                     f"sharpe={split.get('sharpe_ratio', 0):.3f} | "
-                    f"benchmark_return={split.get('benchmark_annualized_return', 0):.2%}\n"
+                    f"benchmark_vol={split.get('benchmark_annualized_volatility', 0):.2%} | "
+                    f"benchmark_max_dd={split.get('benchmark_max_drawdown', 0):.2%}\n"
                 )
         else:
             report += "- Temporal split evaluation disabled\n"
@@ -443,27 +491,26 @@ outputs/swarm_allocator_aco/
         )
         if comparison:
             self.logger.info(
-                "Benchmark: return=%s | sharpe=%.3f | max_dd=%s",
-                f"{summary.get('benchmark_annualized_return', 0):.2%}",
-                summary.get("benchmark_sharpe_ratio", 0.0),
+                "Benchmark risk anchor: vol=%s | max_dd=%s",
+                f"{summary.get('benchmark_annualized_volatility', 0):.2%}",
                 f"{summary.get('benchmark_max_drawdown', 0):.2%}",
             )
             self.logger.info(
-                "Comparison: total_return_delta=%s | beat_benchmark=%s | daily_hit_rate=%s",
-                f"{summary.get('excess_total_return', 0):.2%}",
-                comparison.get("beat_benchmark_total_return", False),
-                f"{comparison.get('daily_hit_rate_vs_benchmark', 0):.2%}",
+                "Risk alignment: vol_gap=%s | drawdown_gap=%s | score=%.3f",
+                f"{comparison.get('volatility_gap', 0):.2%}",
+                f"{comparison.get('drawdown_gap', 0):.2%}",
+                comparison.get("risk_alignment_score", 0.0),
             )
         split_summary = results.get("split_summary", {})
         test_split = split_summary.get("test", {}) if split_summary else {}
         if test_split:
             self.logger.info(
-                "Temporal test: %s -> %s | return=%s | sharpe=%.3f | benchmark=%s",
+                "Temporal test: %s -> %s | return=%s | sharpe=%.3f | benchmark_vol=%s",
                 test_split.get("start_date", "n/a"),
                 test_split.get("end_date", "n/a"),
                 f"{test_split.get('annualized_return', 0):.2%}",
                 test_split.get("sharpe_ratio", 0.0),
-                f"{test_split.get('benchmark_annualized_return', 0):.2%}",
+                f"{test_split.get('benchmark_annualized_volatility', 0):.2%}",
             )
         self.logger.info(
             "Artifacts: %s",

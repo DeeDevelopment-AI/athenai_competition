@@ -125,3 +125,4 @@ tmp/
 temp/
 *.tmp
 /data/
+/outputs/

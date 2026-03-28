@@ -73,6 +73,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.base_runner import PhaseRunner
+from src.evaluation.audit import (
+    build_periodic_allocation_rows,
+    compress_daily_weight_history,
+)
 
 
 # =============================================================================
@@ -121,6 +125,16 @@ class Phase6Runner(PhaseRunner):
 
     phase_name = "Phase 6: Walk-Forward Evaluation"
     phase_number = 6
+
+    def _run_tag(self) -> str:
+        if not self.args:
+            return ""
+        agent = getattr(self.args, 'agent', 'ppo')
+        source = getattr(self.args, 'run_id', None) or "latest"
+        tag = f"{agent}_{source}"
+        if getattr(self.args, 'quick', False):
+            tag += "_quick"
+        return tag
 
     def add_arguments(self, parser: argparse.ArgumentParser):
         """Add Phase 6 specific arguments."""
@@ -184,6 +198,10 @@ class Phase6Runner(PhaseRunner):
         parser.add_argument(
             '--sample', type=int, default=None,
             help='Use only N algorithms (must match training)'
+        )
+        parser.add_argument(
+            '--input-dir', type=str, default=None,
+            help='Override processed dataset root used for evaluation universe'
         )
         parser.add_argument(
             '--seed', type=int, default=42,
@@ -334,15 +352,28 @@ class Phase6Runner(PhaseRunner):
             'comparison': {},
         }
 
-        # Determine paths
-        output_dir = self.get_output_dir()
+        # Output dir and run_id are managed by PhaseRunner.execute() via _run_tag()
         models_dir = self._resolve_models_dir(args)
+        output_dir = self.get_output_dir()
+        self.logger.info(f"Evaluation run ID: {self._run_id or output_dir.name}")
 
         # ==================================================================
         # STEP 6.1: LOAD DATA
         # ==================================================================
+        input_dir = self._resolve_input_dir(args, models_dir)
+
         with self.step("6.1 Load Data"):
-            algo_returns, benchmark_weights, benchmark_returns = self._load_data()
+            algo_returns, benchmark_weights, benchmark_returns = self._load_data(input_dir)
+            selected_algos_path = models_dir.parent / "cluster_selection" / "selected_algos.csv"
+            if selected_algos_path.exists():
+                selected_algos = pd.read_csv(selected_algos_path)["algo_id"].dropna().astype(str).tolist()
+                selected_cols = [c for c in algo_returns.columns if c in selected_algos]
+                algo_returns = algo_returns[selected_cols]
+                if benchmark_weights is not None:
+                    benchmark_weights = benchmark_weights.reindex(columns=selected_cols, fill_value=0.0)
+                self.logger.info(
+                    f"Applied Phase 5 selected universe from {selected_algos_path.name}: {len(selected_cols)} algos"
+                )
 
             # Sample if requested - must match training configuration
             if args.sample and args.sample < len(algo_returns.columns):
@@ -441,6 +472,7 @@ class Phase6Runner(PhaseRunner):
                         benchmark_weights=benchmark_weights,
                         benchmark_returns=benchmark_returns,
                         config=config,
+                        output_dir=output_dir,
                     )
                     results['baselines'][baseline_name] = baseline_results
 
@@ -464,12 +496,37 @@ class Phase6Runner(PhaseRunner):
 
         return results
 
-    def _load_data(self):
+    def _resolve_input_dir(self, args, models_dir: Path) -> Path:
+        """Resolve evaluation dataset root."""
+        if args.input_dir:
+            return Path(args.input_dir)
+
+        run_info_path = models_dir.parent / "run_info.json"
+        if run_info_path.exists():
+            try:
+                run_info = json.loads(run_info_path.read_text(encoding="utf-8"))
+                input_dir = run_info.get("input_dir")
+                if input_dir:
+                    return Path(input_dir)
+            except Exception:
+                pass
+
+        return self.dp.processed.root
+
+    def _load_data(self, input_dir: Path):
         """Load Phase 1 data."""
         # Load returns matrix
-        returns_path = self.dp.algorithms.returns
+        if input_dir != self.dp.processed.root:
+            candidates = [
+                input_dir / 'algorithms' / 'returns.parquet',
+                input_dir / 'algo_returns.parquet',
+                input_dir / 'returns.parquet',
+            ]
+            returns_path = next((p for p in candidates if p.exists()), self.dp.algorithms.returns)
+        else:
+            returns_path = self.dp.algorithms.returns
         if not returns_path.exists():
-            returns_path = self.dp.processed.root / 'algo_returns.parquet'
+            returns_path = input_dir / 'algo_returns.parquet'
         if not returns_path.exists():
             raise FileNotFoundError(f"Returns matrix not found: {returns_path}")
 
@@ -480,9 +537,17 @@ class Phase6Runner(PhaseRunner):
         self.logger.info(f"Loaded returns: {algo_returns.shape}")
 
         # Load benchmark weights
-        weights_path = self.dp.benchmark.weights
+        if input_dir != self.dp.processed.root:
+            candidates = [
+                input_dir / 'benchmark' / 'weights.parquet',
+                input_dir / 'benchmark_weights.parquet',
+                input_dir / 'weights.parquet',
+            ]
+            weights_path = next((p for p in candidates if p.exists()), self.dp.benchmark.weights)
+        else:
+            weights_path = self.dp.benchmark.weights
         if not weights_path.exists():
-            weights_path = self.dp.processed.root / 'benchmark_weights.parquet'
+            weights_path = input_dir / 'benchmark_weights.parquet'
 
         benchmark_weights = None
         if weights_path.exists():
@@ -493,17 +558,25 @@ class Phase6Runner(PhaseRunner):
             self.logger.info(f"Loaded benchmark weights: {benchmark_weights.shape}")
 
         # Load benchmark returns
-        bench_path = self.dp.benchmark.daily_returns
+        if input_dir != self.dp.processed.root:
+            candidates = [
+                input_dir / 'benchmark' / 'daily_returns.csv',
+                input_dir / 'benchmark_daily_returns.csv',
+                input_dir / 'daily_returns.csv',
+            ]
+            bench_path = next((p for p in candidates if p.exists()), self.dp.benchmark.daily_returns)
+        else:
+            bench_path = self.dp.benchmark.daily_returns
         if not bench_path.exists():
-            bench_path = self.dp.processed.root / 'benchmark_daily_returns.csv'
+            bench_path = input_dir / 'benchmark_daily_returns.csv'
 
         benchmark_returns = None
         if bench_path.exists():
             bench_df = pd.read_csv(bench_path, index_col=0, parse_dates=True)
             if 'return' in bench_df.columns:
-                benchmark_returns = bench_df['return']
+                benchmark_returns = bench_df['return'].dropna()
             else:
-                benchmark_returns = bench_df.iloc[:, 0]
+                benchmark_returns = bench_df.iloc[:, 0].dropna()
             self.logger.info(f"Loaded benchmark returns: {len(benchmark_returns)} days")
 
         return algo_returns, benchmark_weights, benchmark_returns
@@ -542,7 +615,7 @@ class Phase6Runner(PhaseRunner):
             max_exposure=config.max_exposure,
         )
         reward_fn = RewardFunction(
-            reward_type=RewardType.ALPHA_PENALIZED,
+            reward_type=RewardType.RISK_CALIBRATED_RETURNS,
         )
 
         # Load agent
@@ -589,6 +662,7 @@ class Phase6Runner(PhaseRunner):
 
         fold_results = []
         all_test_returns = []
+        allocation_rows = []
 
         for fold in folds:
             self.logger.info(f"  Processing fold {fold['fold_id']}...")
@@ -633,6 +707,7 @@ class Phase6Runner(PhaseRunner):
             done = False
             episode_returns = []
             episode_dates = []
+            episode_weights = []
             total_reward = 0
 
             while not done:
@@ -645,6 +720,8 @@ class Phase6Runner(PhaseRunner):
                     episode_returns.append(info['portfolio_return'])
                 if 'date' in info:
                     episode_dates.append(info['date'])
+                if 'weights' in info:
+                    episode_weights.append(np.asarray(info['weights'], dtype=np.float32))
 
                 done = bool(dones[0])
 
@@ -669,6 +746,24 @@ class Phase6Runner(PhaseRunner):
                 })
 
                 all_test_returns.extend(episode_returns)
+                snapshot_dates, snapshot_weights = compress_daily_weight_history(
+                    episode_dates,
+                    episode_weights,
+                )
+                allocation_rows.extend(
+                    build_periodic_allocation_rows(
+                        snapshot_dates,
+                        snapshot_weights,
+                        algo_returns.columns.tolist(),
+                        final_period_end=fold['test_end'],
+                        metadata={
+                            'strategy': agent_name,
+                            'strategy_type': 'rl_agent',
+                            'fold_id': int(fold['fold_id']),
+                            'split': 'test',
+                        },
+                    )
+                )
 
         # Aggregate metrics across folds
         aggregated = self._aggregate_fold_metrics(fold_results)
@@ -678,6 +773,9 @@ class Phase6Runner(PhaseRunner):
         fold_path = output_dir / "walk_forward" / f"{agent_name}_folds.csv"
         fold_path.parent.mkdir(parents=True, exist_ok=True)
         fold_df.to_csv(fold_path, index=False)
+        if allocation_rows:
+            allocations_path = output_dir / "walk_forward" / f"{agent_name}_allocations.csv"
+            pd.DataFrame(allocation_rows).to_csv(allocations_path, index=False)
 
         self.logger.info(f"  Aggregated Sharpe: {aggregated.get('sharpe_ratio_mean', 0):.3f}")
         self.logger.info(f"  Aggregated Return: {aggregated.get('annualized_return_mean', 0):.2%}")
@@ -688,6 +786,7 @@ class Phase6Runner(PhaseRunner):
             'n_folds': len(fold_results),
             'fold_results': fold_results,
             'aggregated': aggregated,
+            'allocations_path': str(output_dir / "walk_forward" / f"{agent_name}_allocations.csv") if allocation_rows else None,
         }
 
     def _evaluate_baseline(
@@ -698,6 +797,7 @@ class Phase6Runner(PhaseRunner):
         benchmark_weights: Optional[pd.DataFrame],
         benchmark_returns: Optional[pd.Series],
         config: EvalConfig,
+        output_dir: Path,
     ) -> dict:
         """Evaluate a classical baseline using walk-forward."""
         from src.baselines.equal_weight import EqualWeightAllocator
@@ -723,6 +823,7 @@ class Phase6Runner(PhaseRunner):
             raise ValueError(f"Unknown baseline: {baseline_name}")
 
         fold_results = []
+        allocation_rows = []
 
         for fold in folds:
             self.logger.info(f"  Processing fold {fold['fold_id']}...")
@@ -759,9 +860,29 @@ class Phase6Runner(PhaseRunner):
                 'test_end': str(fold['test_end'].date()),
                 **metrics,
             })
+            allocation_rows.extend(
+                build_periodic_allocation_rows(
+                    [fold['test_start']],
+                    [weights],
+                    algo_returns.columns.tolist(),
+                    final_period_end=fold['test_end'],
+                    metadata={
+                        'strategy': baseline_name,
+                        'strategy_type': 'baseline',
+                        'fold_id': int(fold['fold_id']),
+                        'split': 'test',
+                    },
+                )
+            )
 
         # Aggregate metrics across folds
         aggregated = self._aggregate_fold_metrics(fold_results)
+
+        if allocation_rows:
+            allocations_dir = output_dir / "walk_forward"
+            allocations_dir.mkdir(parents=True, exist_ok=True)
+            allocations_path = allocations_dir / f"{baseline_name}_allocations.csv"
+            pd.DataFrame(allocation_rows).to_csv(allocations_path, index=False)
 
         self.logger.info(f"  Aggregated Sharpe: {aggregated.get('sharpe_ratio_mean', 0):.3f}")
         self.logger.info(f"  Aggregated Return: {aggregated.get('annualized_return_mean', 0):.2%}")
@@ -770,6 +891,7 @@ class Phase6Runner(PhaseRunner):
             'n_folds': len(fold_results),
             'fold_results': fold_results,
             'aggregated': aggregated,
+            'allocations_path': str(output_dir / "walk_forward" / f"{baseline_name}_allocations.csv") if allocation_rows else None,
         }
 
     def _aggregate_fold_metrics(self, fold_results: List[dict]) -> dict:

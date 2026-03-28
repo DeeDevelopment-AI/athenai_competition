@@ -161,10 +161,11 @@ def test_phase7_aco_runner_executes_with_existing_artifacts(mock_phase_inputs):
     )
 
     assert results["status"] == "completed"
-    assert (output_dir / "weights" / "weights.parquet").exists()
-    assert (output_dir / "backtests" / "portfolio_returns.csv").exists()
-    assert (output_dir / "reports" / "summary.json").exists()
-    assert (output_dir / "reports" / "comparison.json").exists()
+    # Outputs are in a timestamped subdir; use paths from results dict
+    assert Path(results["outputs"]["weights_path"]).exists()
+    assert Path(results["outputs"]["portfolio_returns_path"]).exists()
+    assert Path(results["outputs"]["summary_path"]).exists()
+    assert Path(results["outputs"]["comparison_path"]).exists()
     assert results["summary"]["objective_name"] == "aco_sharpe_balanced"
     assert results["artifacts"]["cluster_history_available"] is True
     assert results["artifacts"]["cluster_stability_available"] is True

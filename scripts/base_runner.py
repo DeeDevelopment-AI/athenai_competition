@@ -63,6 +63,7 @@ class PhaseRunner(ABC):
         self.monitor: Optional[PhaseMonitor] = None
         self.results: dict = {}
         self.logger = logging.getLogger(self.__class__.__name__)
+        self._run_id: Optional[str] = None  # set once in execute()
 
         # Paths
         self.dp = data_paths()
@@ -166,41 +167,96 @@ class PhaseRunner(ABC):
             raise RuntimeError("Monitor not initialized. Call execute() instead of run() directly.")
         return self.monitor.step(name)
 
-    def get_output_dir(self) -> Path:
-        """Get the output directory for this phase."""
-        if self.args and self.args.output_dir:
-            return Path(self.args.output_dir)
+    # ------------------------------------------------------------------
+    # Run-tracking infrastructure
+    # ------------------------------------------------------------------
 
-        # Default output directories by phase
+    def _phase_root(self) -> Path:
+        """Root output directory for this phase (parent of all run subdirs)."""
         if self.phase_number == 1:
-            return self.dp.processed.root
+            return self.op.data_pipeline.root
         elif self.phase_number == 2:
-            return self.dp.processed.analysis.root
+            return self.op.analysis.root
         elif self.phase_number == 3:
             return self.op.baselines.root
+        elif self.phase_number == 4:
+            return self.op.environment.root
         elif self.phase_number == 5:
             return self.op.rl_training.root
         elif self.phase_number == 6:
             return self.op.evaluation.root
         elif self.phase_number == 7:
-            return self.op.swarm.root
+            return self.op.swarm_pso.root
+        elif self.phase_number == 8:
+            return self.op.swarm_aco.root
         else:
             return self.op.root / f"phase{self.phase_number}"
 
+    def _run_tag(self) -> str:
+        """
+        Short string summarising the key arguments for this run.
+        Included in the run directory name so different invocations produce
+        distinct, human-readable folders.  Override in each runner.
+        """
+        return ""
+
+    def _make_run_id(self) -> str:
+        """Build run_id = {YYYYMMDD_HHMMSS}[_{tag}]."""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tag = self._run_tag()
+        return f"{ts}_{tag}" if tag else ts
+
+    # ------------------------------------------------------------------
+    # Output / report directories
+    # ------------------------------------------------------------------
+
+    def get_output_dir(self) -> Path:
+        """
+        Output directory for data/artifact files.
+
+        Phases 1 and 2: processed data goes to the canonical data/processed/
+        locations (fixed paths consumed by downstream phases).
+        All other phases: outputs go inside a timestamped run subdir.
+        --output-dir always overrides.
+        """
+        if self.args and self.args.output_dir:
+            return Path(self.args.output_dir)
+
+        if self.phase_number == 1:
+            return self.dp.processed.root
+        elif self.phase_number == 2:
+            return self.dp.processed.analysis.root
+        else:
+            root = self._phase_root()
+            run_id = self._run_id or self._make_run_id()
+            return root / run_id
+
+    def _report_dir(self) -> Path:
+        """
+        Directory for phase reports (metrics JSON, results JSON, SUMMARY.md).
+
+        All phases write reports into a timestamped run subdir under outputs/.
+        Phases 1-2 keep their canonical *data* files at fixed paths but still
+        write reports into a per-run subdir.
+        --output-dir always overrides (used by tests).
+        """
+        if self.args and self.args.output_dir:
+            return Path(self.args.output_dir)
+        root = self._phase_root()
+        run_id = self._run_id or self._make_run_id()
+        return root / run_id
+
     def get_metrics_path(self) -> Path:
         """Get path for saving performance metrics."""
-        output_dir = self.get_output_dir()
-        return output_dir / f"phase{self.phase_number}_metrics.json"
+        return self._report_dir() / f"phase{self.phase_number}_metrics.json"
 
     def get_results_path(self) -> Path:
         """Get path for saving results."""
-        output_dir = self.get_output_dir()
-        return output_dir / f"phase{self.phase_number}_results.json"
+        return self._report_dir() / f"phase{self.phase_number}_results.json"
 
     def get_summary_path(self) -> Path:
         """Get path for saving markdown summary."""
-        output_dir = self.get_output_dir()
-        return output_dir / f"PHASE{self.phase_number}_SUMMARY.md"
+        return self._report_dir() / f"PHASE{self.phase_number}_SUMMARY.md"
 
     def execute(self, args: Optional[list[str]] = None) -> dict:
         """
@@ -216,12 +272,20 @@ class PhaseRunner(ABC):
         parser = self.create_parser()
         self.args = parser.parse_args(args)
 
+        # Compute run_id once (timestamp + key-arg tag) so that
+        # get_output_dir() / _report_dir() are stable throughout the run.
+        # Skip when --output-dir is set explicitly (tests / manual override).
+        if not self.args.output_dir:
+            self._run_id = self._make_run_id()
+
         # Setup logging
         log_file = Path(self.args.log_file) if self.args.log_file else None
         self.setup_logging(verbose=self.args.verbose, log_file=log_file)
 
         # Print header
         self._print_header()
+        if self._run_id:
+            self.logger.info(f"Run ID: {self._run_id}")
 
         # Dry run check
         if self.args.dry_run:
@@ -229,9 +293,20 @@ class PhaseRunner(ABC):
             self.logger.info(f"Output directory: {self.get_output_dir()}")
             return {}
 
-        # Ensure output directory exists
+        # Create output directories
         output_dir = self.get_output_dir()
         ensure_dir(output_dir)
+
+        # For phases 1-2, report dir differs from data output dir
+        report_dir = self._report_dir()
+        if report_dir != output_dir:
+            ensure_dir(report_dir)
+
+        # Write latest_run.txt so any downstream phase can find the latest run
+        if self._run_id:
+            phase_root = self._phase_root()
+            ensure_dir(phase_root)
+            (phase_root / "latest_run.txt").write_text(self._run_id)
 
         # Initialize monitor
         self.monitor = PhaseMonitor(self.phase_name)
@@ -281,6 +356,7 @@ class PhaseRunner(ABC):
         """Save performance metrics and results."""
         # Save performance metrics
         metrics_path = self.get_metrics_path()
+        ensure_parent_dir(metrics_path)
         self.monitor.save_report(metrics_path)
 
         # Save results

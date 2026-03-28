@@ -33,6 +33,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from notebook_paths import default_output_dir, raw_algos_path, raw_benchmark_path
 try:
     from algo_pipeline import load_algorithm_csv, trim_dead_tail
 except ImportError:
@@ -239,10 +240,11 @@ def compare_with_actual(actual_series, recon_series, method_name):
 
 def main():
     parser = argparse.ArgumentParser(description='Reconstruct fund-of-algorithms benchmark v2')
-    parser.add_argument('--trades', required=True, help='trades_benchmark.csv')
-    parser.add_argument('--monthly', required=True, help='benchmark_monthly_returns.csv')
-    parser.add_argument('--algos', required=True, help='Directory with algorithm CSVs')
-    parser.add_argument('--output', default='results', help='Output directory')
+    parser.add_argument('--trades', default=str(raw_benchmark_path('trades_benchmark.csv')), help='trades_benchmark.csv')
+    parser.add_argument('--monthly', default=str(raw_benchmark_path('benchmark_monthly_returns.csv')),
+                        help='benchmark_monthly_returns.csv')
+    parser.add_argument('--algos', default=str(raw_algos_path()), help='Directory with algorithm CSVs')
+    parser.add_argument('--output', default=str(default_output_dir('reconstruction')), help='Output directory')
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
 

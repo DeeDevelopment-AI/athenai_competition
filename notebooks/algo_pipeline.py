@@ -45,6 +45,8 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+from notebook_paths import default_output_dir, raw_algos_path, raw_path
+
 
 # ============================================================
 # DATA LOADING
@@ -1496,9 +1498,9 @@ def process_single_algo(args):
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze trading algorithms at scale')
-    parser.add_argument('--algos', required=True, help='Directory with algorithm CSVs')
-    parser.add_argument('--benchmarks', required=True, help='Directory with benchmark CSVs')
-    parser.add_argument('--output', default='results', help='Output directory')
+    parser.add_argument('--algos', default=str(raw_algos_path()), help='Directory with algorithm CSVs')
+    parser.add_argument('--benchmarks', default=str(raw_path()), help='Directory with benchmark CSVs')
+    parser.add_argument('--output', default=str(default_output_dir('pipeline')), help='Output directory')
     parser.add_argument('--workers', type=int, default=4, help='Parallel workers')
     parser.add_argument('--limit', type=int, default=None, help='Limit number of algos (for testing)')
     parser.add_argument('--debug', action='store_true', help='Print errors as they happen + save error log')

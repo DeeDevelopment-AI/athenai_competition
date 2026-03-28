@@ -49,6 +49,14 @@ class Phase1Runner(PhaseRunner):
     phase_name = "Phase 1: Data Loading & Feature Engineering"
     phase_number = 1
 
+    def _run_tag(self) -> str:
+        parts = []
+        if getattr(self.args, 'sample', None):
+            parts.append(f"s{self.args.sample}")
+        if getattr(self.args, 'skip_features', False):
+            parts.append("nofeat")
+        return "_".join(parts)
+
     def add_arguments(self, parser: argparse.ArgumentParser):
         """Add Phase 1 specific arguments."""
         parser.add_argument(
@@ -450,8 +458,8 @@ class Phase1Runner(PhaseRunner):
                 benchmark_features.to_parquet(self.dp.benchmark.algo_features)
                 self.logger.info(f"  benchmark/algo_features.parquet")
 
-            # --- Reports -> data/processed/reports/phase1/ ---
-            reports_dir = self.dp.processed.reports.root / "phase1"
+            # --- Reports -> outputs/data_pipeline/ ---
+            reports_dir = self.op.data_pipeline.root
             reports_dir.mkdir(parents=True, exist_ok=True)
 
         # Generate markdown report
@@ -541,9 +549,10 @@ data/processed/
 │   ├── concentration.csv       # HHI concentration
 │   ├── algo_equity.parquet     # Equity curves (benchmark products)
 │   └── algo_features.parquet   # Features (benchmark products)
-└── reports/phase1/
-    ├── SUMMARY.md              # This report
-    └── results.json            # Metrics JSON
+outputs/data_pipeline/
+    ├── PHASE1_SUMMARY.md       # This report
+    ├── phase1_results.json     # Results JSON
+    └── phase1_metrics.json     # Performance metrics
 ```
 
 ## Next Steps
@@ -553,12 +562,12 @@ data/processed/
 3. Check `algorithms/asset_inference.csv` for underlying asset analysis
 4. Proceed to Phase 2: Analysis and Regime Detection
 """
-        # Save to organized path
-        report_path = self.dp.processed.reports.phase1_summary
+        # Save to outputs/data_pipeline/
+        report_path = self.op.data_pipeline.root / "PHASE1_SUMMARY.md"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write(report)
-        self.logger.info(f"Report saved to {report_path.relative_to(self.dp.processed.root)}")
+        self.logger.info(f"Report saved to {report_path}")
 
     def _format_asset_class_table(self, asset_class_dist: dict) -> str:
         """Format asset class distribution as markdown table."""

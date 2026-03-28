@@ -336,6 +336,29 @@ class AlgoUniverseEncoder:
         full_weights[self._static_indices] = raw_static.astype(np.float32)
         return full_weights
 
+    def encode_weights(self, full_weights: np.ndarray) -> np.ndarray:
+        """
+        Project full algo weights into PCA action space (approximate left-inverse of decode_action).
+
+        Useful for behavioral cloning: maps expert full-space allocations to the compressed
+        action representation that the policy outputs.
+
+        Unlike decode_action, no alive mask is applied — the caller should ensure that
+        full_weights are already zero for inactive algos if needed.
+
+        Args:
+            full_weights: (n_total_algos,) weight vector in the original algo space.
+
+        Returns:
+            (n_pca,) PCA-space action vector.
+        """
+        self._check_fitted()
+        # Extract static algos, center by PCA mean, project onto principal components
+        w_static = full_weights[self._static_indices].astype(np.float32)
+        w_centered = w_static - self._pca_mean                          # (n_static,)
+        pc_weights = self._pca_components @ w_centered                  # (n_pca,)
+        return pc_weights.astype(np.float32)
+
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
@@ -385,9 +408,9 @@ class FamilyEncoder:
         Zero out algos that had no returns in the last activity_window days.
         Applied at every step using only past data (no look-ahead).
 
-    Obs: (N_families × 5) + 3 scalars
+    Obs: (N_families × 5) + 4 scalars
         Per family: avg_ret5d, avg_ret21d, avg_vol, avg_current_weight, frac_active
-        Scalars: avg_corr, drawdown, excess_return (from MarketSimulator raw obs)
+        Scalars: avg_corr, drawdown, momentum_breadth, vol_regime (from MarketSimulator raw obs)
 
     Action: N_families weights → equal weight within each family among alive algos.
 
@@ -650,6 +673,30 @@ class FamilyEncoder:
             full_weights /= total
 
         return full_weights
+
+    def encode_weights(self, full_weights: np.ndarray) -> np.ndarray:
+        """
+        Project full algo weights into family action space (approximate left-inverse of decode_action).
+
+        Family weight f = sum of the individual algo weights belonging to family f,
+        then normalized to sum to 1.  Useful for behavioral cloning: maps expert
+        full-space allocations to the N-family action vector the policy outputs.
+
+        Args:
+            full_weights: (n_total_algos,) weight vector in the original algo space.
+
+        Returns:
+            (n_families,) family-space weight vector.
+        """
+        self._check_fitted()
+        # Vectorized: family_weight[f] = Σ full_weights[family_masks[f]]
+        family_weights = (
+            self._family_masks.astype(np.float32) @ full_weights.astype(np.float32)
+        )
+        total = float(family_weights.sum())
+        if total > 1e-8:
+            family_weights = family_weights / total
+        return family_weights.astype(np.float32)
 
     # ------------------------------------------------------------------
     # Diagnostics

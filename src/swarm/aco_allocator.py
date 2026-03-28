@@ -23,10 +23,12 @@ import numpy as np
 import pandas as pd
 
 from .meta_allocator import (
+    HAS_TORCH,
     SwarmAllocatorBacktester,
     SwarmConfig,
     SwarmMetaAllocator,
     SwarmOptimizationResult,
+    torch,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,7 +49,7 @@ class ACOConfig(SwarmConfig):
     heuristic_floor: float = 1e-3
     sharpe_weight: float = 1.75
     entropy_reward_weight: float = 0.05
-    use_gpu: bool = False
+    use_gpu: bool = True
     objective_name: str = "aco_sharpe_balanced"
 
 
@@ -65,6 +67,14 @@ class ACOMetaAllocator(SwarmMetaAllocator):
         algo_ids = returns_window.columns.tolist()
         returns_np = returns_window.fillna(0.0).to_numpy(dtype=np.float32, copy=False)
         family_matrix = self._build_family_matrix(algo_ids)
+        if HAS_TORCH and self.config.use_gpu and self.device.startswith("cuda"):
+            return self._optimize_aco_torch(
+                returns_np=returns_np,
+                previous_weights=previous_weights.astype(np.float32, copy=False),
+                algo_ids=algo_ids,
+                family_matrix=family_matrix,
+                regime_weights=regime_weights,
+            )
         return self._optimize_aco(
             returns_np=returns_np,
             previous_weights=previous_weights.astype(np.float32, copy=False),
@@ -192,6 +202,151 @@ class ACOMetaAllocator(SwarmMetaAllocator):
             active_count=int(best_diag.get("active_count", 0.0)),
         )
 
+    def _optimize_aco_torch(
+        self,
+        returns_np: np.ndarray,
+        previous_weights: np.ndarray,
+        algo_ids: list[str],
+        family_matrix: Optional[np.ndarray],
+        regime_weights: Optional[np.ndarray],
+    ) -> SwarmOptimizationResult:
+        n_assets = returns_np.shape[1]
+        if n_assets == 0:
+            raise ValueError("ACO optimizer received an empty universe")
+
+        n_buckets = max(int(self.config.weight_buckets), 2)
+        device = self._torch_device
+        pheromone = torch.ones((n_assets, n_buckets), dtype=torch.float32, device=device)
+        bucket_values = torch.linspace(0.0, 1.0, n_buckets, dtype=torch.float32, device=device)
+        heuristic_np, asset_strength_np = self._build_heuristic_matrix(returns_np, algo_ids)
+        heuristic = torch.as_tensor(heuristic_np, dtype=torch.float32, device=device)
+        asset_strength = torch.as_tensor(asset_strength_np, dtype=torch.float32, device=device)
+        fallback_order = torch.argsort(asset_strength, descending=True)
+
+        family_caps = self._build_family_caps(algo_ids)
+        family_reward_vector = self._build_family_reward_vector(algo_ids)
+        returns_tensor = torch.as_tensor(returns_np, dtype=torch.float32, device=device)
+        previous_tensor = torch.as_tensor(previous_weights, dtype=torch.float32, device=device)
+        family_tensor = torch.as_tensor(family_matrix, dtype=torch.float32, device=device) if family_matrix is not None else None
+        family_caps_tensor = torch.as_tensor(family_caps, dtype=torch.float32, device=device) if family_caps is not None else None
+        family_reward_tensor = (
+            torch.as_tensor(family_reward_vector, dtype=torch.float32, device=device)
+            if family_reward_vector is not None
+            else None
+        )
+        regime_tensor = (
+            torch.as_tensor(regime_weights, dtype=torch.float32, device=device)
+            if regime_weights is not None
+            else None
+        )
+
+        seed_buckets_np = self._build_seed_buckets(previous_weights, asset_strength_np, n_buckets)
+        seed_buckets = [
+            torch.as_tensor(seed, dtype=torch.long, device=device)
+            for seed in seed_buckets_np
+        ]
+
+        n_ants = max(int(self.config.n_ants), 1)
+        elite_ants = max(1, min(int(self.config.elite_ants), n_ants))
+        best_score = float("-inf")
+        best_weights = torch.full((n_assets,), 1.0 / max(n_assets, 1), dtype=torch.float32, device=device)
+        best_buckets = seed_buckets[0].clone()
+        best_diag: dict[str, float] = {}
+        best_iteration = -1
+        min_weight_deposit = 1.0 / max(n_assets * 4, 1)
+        asset_idx = torch.arange(n_assets, device=device)
+
+        for iteration in range(max(int(self.config.n_iterations), 1)):
+            desirability = torch.pow(pheromone, float(self.config.pheromone_power)) * torch.pow(
+                heuristic,
+                float(self.config.heuristic_power),
+            )
+            probabilities = desirability / desirability.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            ant_buckets = torch.multinomial(probabilities, num_samples=n_ants, replacement=True).T.contiguous()
+            ant_weights = self._buckets_to_weights_torch(
+                ant_buckets,
+                bucket_values=bucket_values,
+                fallback_order=fallback_order,
+            )
+
+            for seed_idx, seed in enumerate(seed_buckets[: min(len(seed_buckets), n_ants)]):
+                ant_buckets[seed_idx] = seed
+                ant_weights[seed_idx] = self._buckets_to_weights_torch(
+                    seed.unsqueeze(0),
+                    bucket_values=bucket_values,
+                    fallback_order=fallback_order,
+                )[0]
+
+            scores, diagnostics = self._evaluate_aco_torch(
+                weights=ant_weights,
+                returns_tensor=returns_tensor,
+                previous_weights=previous_tensor,
+                family_tensor=family_tensor,
+                family_caps_tensor=family_caps_tensor,
+                family_reward_tensor=family_reward_tensor,
+                regime_tensor=regime_tensor,
+            )
+
+            iteration_best_idx = int(torch.argmax(scores).item())
+            iteration_best_score = float(scores[iteration_best_idx].item())
+            if iteration_best_score > best_score:
+                best_score = iteration_best_score
+                final_weights, _ = self._finalize_weights_torch(
+                    ant_weights[iteration_best_idx : iteration_best_idx + 1],
+                    returns_tensor=returns_tensor,
+                    regime_tensor=regime_tensor,
+                )
+                best_weights = final_weights[0]
+                best_buckets = ant_buckets[iteration_best_idx].clone()
+                best_diag = {
+                    key: float(value[iteration_best_idx].detach().cpu().item())
+                    for key, value in diagnostics.items()
+                }
+                best_iteration = iteration
+
+            pheromone *= max(1e-6, 1.0 - float(self.config.evaporation_rate))
+            elite_scores, elite_pos = torch.topk(scores, k=elite_ants)
+            elite_buckets = ant_buckets[elite_pos]
+            elite_weights = ant_weights[elite_pos]
+
+            score_floor = elite_scores.min()
+            shifted = elite_scores - score_floor
+            scale = shifted.max()
+            if float(scale.item()) < 1e-8:
+                scaled_deposits = torch.full(
+                    (elite_ants,),
+                    float(self.config.pheromone_deposit_scale),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            else:
+                scaled_deposits = ((shifted / scale) + float(self.config.heuristic_floor)) * float(
+                    self.config.pheromone_deposit_scale
+                )
+
+            for elite_idx in range(elite_ants):
+                deposit = scaled_deposits[elite_idx] * torch.clamp(elite_weights[elite_idx], min=min_weight_deposit)
+                pheromone[asset_idx, elite_buckets[elite_idx]] += deposit
+
+            pheromone[asset_idx, best_buckets] += float(self.config.pheromone_deposit_scale)
+            pheromone = torch.clamp(pheromone, min=float(self.config.heuristic_floor), max=1e6)
+
+        best_diag = {
+            **best_diag,
+            "best_iteration": float(best_iteration),
+            "n_ants": float(n_ants),
+            "weight_buckets": float(n_buckets),
+            "pheromone_mean": float(pheromone.mean().detach().cpu().item()),
+            "pheromone_std": float(pheromone.std().detach().cpu().item()),
+        }
+        return SwarmOptimizationResult(
+            weights=best_weights.detach().cpu().numpy().astype(np.float32, copy=False),
+            score=float(best_score),
+            selected_algorithms=algo_ids,
+            diagnostics=best_diag,
+            active_count=int(best_diag.get("active_count", 0.0)),
+        )
+
     def _build_seed_buckets(
         self,
         previous_weights: np.ndarray,
@@ -289,6 +444,23 @@ class ACOMetaAllocator(SwarmMetaAllocator):
         normalized = raw / np.maximum(raw.sum(), 1e-8)
         return self._project_weights_numpy(normalized[None, :])[0]
 
+    def _buckets_to_weights_torch(
+        self,
+        bucket_indices: torch.Tensor,
+        bucket_values: torch.Tensor,
+        fallback_order: torch.Tensor,
+    ) -> torch.Tensor:
+        raw = bucket_values[bucket_indices]
+        row_sums = raw.sum(dim=1, keepdim=True)
+        zero_rows = row_sums.squeeze(1) <= 1e-8
+        if torch.any(zero_rows):
+            raw = raw.clone()
+            raw[zero_rows] = 0.0
+            raw[zero_rows, int(fallback_order[0].item())] = float(bucket_values[-1].item())
+            row_sums = raw.sum(dim=1, keepdim=True)
+        normalized = raw / row_sums.clamp(min=1e-8)
+        return self._project_weights_torch(normalized)
+
     def _evaluate_aco_numpy(
         self,
         weights: np.ndarray,
@@ -384,6 +556,106 @@ class ACOMetaAllocator(SwarmMetaAllocator):
         }
         return score, diagnostics
 
+    def _evaluate_aco_torch(
+        self,
+        weights: torch.Tensor,
+        returns_tensor: torch.Tensor,
+        previous_weights: torch.Tensor,
+        family_tensor: Optional[torch.Tensor],
+        family_caps_tensor: Optional[torch.Tensor],
+        family_reward_tensor: Optional[torch.Tensor],
+        regime_tensor: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        weights, exposure_scale = self._finalize_weights_torch(
+            weights=weights,
+            returns_tensor=returns_tensor,
+            regime_tensor=regime_tensor,
+        )
+
+        port_returns = weights @ returns_tensor.T
+        if regime_tensor is not None:
+            weighted_returns = port_returns * regime_tensor.unsqueeze(0)
+            denom = torch.clamp(regime_tensor.sum(), min=1e-8)
+            mean_returns = weighted_returns.sum(dim=1) / denom
+            centered = port_returns - mean_returns.unsqueeze(1)
+            variance = (centered**2 * regime_tensor.unsqueeze(0)).sum(dim=1) / denom
+        else:
+            mean_returns = port_returns.mean(dim=1)
+            variance = port_returns.var(dim=1, unbiased=False)
+
+        ann_return = mean_returns * 252.0
+        ann_vol = torch.sqrt(torch.clamp(variance, min=1e-8)) * np.sqrt(252.0)
+        sharpe_ratio = ann_return / torch.clamp(ann_vol, min=1e-8)
+        turnover = torch.abs(weights - previous_weights.unsqueeze(0)).sum(dim=1) / 2.0
+        concentration = (weights**2).sum(dim=1)
+
+        cov = (
+            torch.cov(returns_tensor.T)
+            if returns_tensor.shape[1] > 1
+            else torch.zeros((returns_tensor.shape[1], returns_tensor.shape[1]), device=weights.device)
+        )
+        cov = torch.nan_to_num(cov, nan=0.0)
+        port_var = torch.einsum("bi,ij,bj->b", weights, cov, weights)
+        diversification = 1.0 - torch.sqrt(torch.clamp(port_var, min=0.0))
+
+        family_penalty = torch.zeros(weights.shape[0], device=weights.device)
+        if family_tensor is not None and family_tensor.shape[1] > 0:
+            family_exposure = weights @ family_tensor
+            caps = (
+                family_caps_tensor.unsqueeze(0)
+                if family_caps_tensor is not None
+                else torch.full_like(family_exposure, self.config.max_family_exposure)
+            )
+            family_penalty = torch.relu(family_exposure - caps).sum(dim=1)
+
+        family_alpha_reward = torch.zeros(weights.shape[0], device=weights.device)
+        if family_reward_tensor is not None:
+            family_alpha_reward = (weights * family_reward_tensor.unsqueeze(0)).sum(dim=1)
+
+        risk_budget_penalty = torch.abs(ann_vol - self.config.target_portfolio_vol)
+        active_count = (weights >= self.config.min_active_weight).to(weights.dtype).sum(dim=1)
+        sparsity_penalty = active_count / max(weights.shape[1], 1)
+        gross_exposure = weights.sum(dim=1)
+        under_investment_penalty = torch.relu(self.config.min_gross_exposure - gross_exposure)
+
+        if weights.shape[1] > 1:
+            entropy = -torch.sum(weights * torch.log(torch.clamp(weights, min=1e-8)), dim=1) / np.log(weights.shape[1])
+        else:
+            entropy = torch.ones(weights.shape[0], device=weights.device)
+
+        score = (
+            self.config.sharpe_weight * sharpe_ratio
+            + self.config.expected_return_weight * ann_return
+            - self.config.volatility_weight * ann_vol
+            - self.config.turnover_weight * turnover
+            - self.config.concentration_weight * concentration
+            + self.config.diversification_weight * diversification
+            + self.config.entropy_reward_weight * entropy
+            - self.config.family_penalty_weight * family_penalty
+            + self.config.family_alpha_reward_weight * family_alpha_reward
+            - self.config.risk_budget_weight * risk_budget_penalty
+            - self.config.sparsity_penalty_weight * sparsity_penalty
+            - self.config.under_investment_penalty_weight * under_investment_penalty
+        )
+
+        diagnostics = {
+            "ann_return": ann_return,
+            "ann_vol": ann_vol,
+            "sharpe_ratio": sharpe_ratio,
+            "turnover": turnover,
+            "concentration": concentration,
+            "diversification": diversification,
+            "entropy": entropy,
+            "family_penalty": family_penalty,
+            "family_alpha_reward": family_alpha_reward,
+            "risk_budget_penalty": risk_budget_penalty,
+            "active_count": active_count,
+            "gross_exposure": gross_exposure,
+            "exposure_scale": exposure_scale,
+            "under_investment_penalty": under_investment_penalty,
+        }
+        return score, diagnostics
+
     def _finalize_weights_numpy(
         self,
         weights: np.ndarray,
@@ -407,6 +679,31 @@ class ACOMetaAllocator(SwarmMetaAllocator):
         gross = np.maximum(finalized_weights.sum(axis=1, keepdims=True), 1e-8)
         normalized = finalized_weights / gross
         finalized_weights = self._project_weights_numpy(normalized) * gross
+        return finalized_weights, exposure_scale
+
+    def _finalize_weights_torch(
+        self,
+        weights: torch.Tensor,
+        returns_tensor: torch.Tensor,
+        regime_tensor: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = self._project_weights_torch(weights)
+        port_returns = weights @ returns_tensor.T
+        if regime_tensor is not None:
+            weighted_returns = port_returns * regime_tensor.unsqueeze(0)
+            denom = torch.clamp(regime_tensor.sum(), min=1e-8)
+            mean_returns = weighted_returns.sum(dim=1) / denom
+            centered = port_returns - mean_returns.unsqueeze(1)
+            variance = (centered**2 * regime_tensor.unsqueeze(0)).sum(dim=1) / denom
+        else:
+            mean_returns = port_returns.mean(dim=1)
+            variance = port_returns.var(dim=1, unbiased=False)
+
+        ann_vol = torch.sqrt(torch.clamp(variance, min=1e-8)) * np.sqrt(252.0)
+        finalized_weights, exposure_scale = self._apply_risk_budget_torch(weights, ann_vol)
+        gross = torch.clamp(finalized_weights.sum(dim=1, keepdim=True), min=1e-8)
+        normalized = finalized_weights / gross
+        finalized_weights = self._project_weights_torch(normalized) * gross
         return finalized_weights, exposure_scale
 
 

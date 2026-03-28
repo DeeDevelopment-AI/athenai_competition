@@ -1,9 +1,9 @@
 benchmark_derived:
-  annualized_return: 0.025925438812402835
-  annualized_volatility: 0.02726483542055332
+  annualized_return: 0.026209798205447665
+  annualized_volatility: 0.027266391937139672
   concentration_hhi_avg: 0.04747599730961507
-  max_drawdown: -0.025957712429929676
-  sharpe_ratio: 0.9524221125514774
+  max_drawdown: -0.025957712429929405
+  sharpe_ratio: 0.9625343157959896
   turnover_annualized: 4.184898140629193
 benchmark_target:
   annualized_return: 0.04610529857855905
@@ -16,4 +16,4 @@ constraints:
   max_weight_per_algo: 0.4
   min_weight_per_algo: 0.0
   rebalance_frequency: daily
-  target_volatility: 0.03271780250466398
+  target_volatility: 0.03271967032456761

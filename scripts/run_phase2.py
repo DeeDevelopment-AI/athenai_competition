@@ -43,6 +43,7 @@ Temporal Clustering Options:
 import argparse
 import gc
 import json
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +63,12 @@ class Phase2Runner(PhaseRunner):
 
     phase_name = "Phase 2: Analysis & Reverse Engineering"
     phase_number = 2
+
+    def _run_tag(self) -> str:
+        method = getattr(self.args, 'family_clustering_method', 'gmm')
+        strategy = getattr(self.args, 'family_refinement_strategy', 'none')
+        n_regimes = getattr(self.args, 'n_regimes', 4)
+        return f"{method}_{strategy}_r{n_regimes}"
 
     def add_arguments(self, parser: argparse.ArgumentParser):
         """Add Phase 2 specific arguments."""
@@ -625,6 +632,18 @@ class Phase2Runner(PhaseRunner):
                     self.logger.error(f"Temporal clustering failed: {e}")
 
         # ==================================================================
+        # SNAPSHOT ANALYSIS ARTIFACTS
+        # ==================================================================
+        with self.step("Snapshot Analysis Artifacts"):
+            snapshot_dir = self.get_output_dir() / "analysis_snapshot"
+            source_dir = self.dp.processed.analysis.root
+            if snapshot_dir.exists():
+                shutil.rmtree(snapshot_dir)
+            shutil.copytree(source_dir, snapshot_dir)
+            self.logger.info(f"Saved analysis snapshot to {snapshot_dir}")
+            results['analysis_snapshot_dir'] = str(snapshot_dir)
+
+        # ==================================================================
         # GENERATE SUMMARY REPORT
         # ==================================================================
         self._generate_markdown_report(results, analysis_dir)
@@ -835,8 +854,10 @@ data/processed/analysis/
     ├── benchmark_conditional.json
     └── family_selection_prob.csv
 
-data/processed/reports/phase2/
-└── SUMMARY.md                  # This report
+outputs/analysis/
+├── PHASE2_SUMMARY.md           # This report
+├── phase2_results.json         # Results JSON
+└── phase2_metrics.json         # Performance metrics
 ```
 
 ## Next Steps
@@ -845,12 +866,12 @@ data/processed/reports/phase2/
 2. Use family labels for strategy grouping
 3. Proceed to Phase 3: Baseline Backtesting
 """
-        # Create reports directory and save
-        report_path = self.dp.processed.reports.root / 'phase2' / 'SUMMARY.md'
+        # Save to outputs/analysis/
+        report_path = self.op.analysis.root / 'PHASE2_SUMMARY.md'
         report_path.parent.mkdir(parents=True, exist_ok=True)
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write(report)
-        self.logger.info(f"Report saved to {report_path.relative_to(self.dp.processed.root)}")
+        self.logger.info(f"Report saved to {report_path}")
 
 
 def main():

@@ -121,6 +121,13 @@ class Phase3Runner(PhaseRunner):
     phase_name = "Phase 3: Baseline Backtesting"
     phase_number = 3
 
+    def _run_tag(self) -> str:
+        if getattr(self.args, 'full', False):
+            return "full"
+        if getattr(self.args, 'quick', False):
+            return "quick"
+        return "standard"
+
     def add_arguments(self, parser: argparse.ArgumentParser):
         """Add Phase 3 specific arguments."""
         parser.add_argument(

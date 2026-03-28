@@ -49,6 +49,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from notebook_paths import default_output_dir, raw_algos_path, raw_benchmark_path
 try:
     from algo_pipeline import load_algorithm_csv, trim_dead_tail
 except ImportError:
@@ -497,10 +498,11 @@ def compare(actual, reconstructed, method_name):
 def main():
     parser = argparse.ArgumentParser(
         description='Benchmark reconstruction WITH cashflows (Dietz methods)')
-    parser.add_argument('--trades', required=True)
-    parser.add_argument('--monthly', required=True, help='benchmark_monthly_returns.csv')
-    parser.add_argument('--algos', required=True, help='Directory with algo CSVs')
-    parser.add_argument('--output', default='results/dietz')
+    parser.add_argument('--trades', default=str(raw_benchmark_path('trades_benchmark.csv')))
+    parser.add_argument('--monthly', default=str(raw_benchmark_path('benchmark_monthly_returns.csv')),
+                        help='benchmark_monthly_returns.csv')
+    parser.add_argument('--algos', default=str(raw_algos_path()), help='Directory with algo CSVs')
+    parser.add_argument('--output', default=str(default_output_dir('dietz')))
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
 

@@ -76,6 +76,8 @@ class TradingEnvironment(gym.Env):
         base_allocator: str = "risk_parity",
         max_tilt: float = 0.15,
         vol_lookback: int = 63,
+        # Cluster-based reward shaping (soft mode)
+        cluster_filter=None,
     ):
         """
         Args:
@@ -131,6 +133,7 @@ class TradingEnvironment(gym.Env):
         self.max_tilt = max_tilt
         self.vol_lookback = vol_lookback
         self._base_allocator_type = BaseAllocatorType(base_allocator)
+        self.cluster_filter = cluster_filter
 
         self.n_algos = self.simulator.n_algos
 
@@ -371,7 +374,10 @@ class TradingEnvironment(gym.Env):
             obs = self._normalize_observation(obs)
 
         # Escalar reward (handle NaN/Inf)
-        reward = result.reward * self.reward_scale
+        raw_reward = result.reward
+        if self.cluster_filter is not None:
+            raw_reward += self.cluster_filter.compute_reward_bonus(sim_action)
+        reward = raw_reward * self.reward_scale
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
 

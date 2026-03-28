@@ -32,6 +32,7 @@ Walk-Forward Configuration:
   --step-size N                 Step size between folds in days (default: 63)
   --expanding                   Use expanding window instead of rolling
   --max-folds N                 Maximum number of folds to evaluate
+  --cpu-only                    Force CPU execution even if CUDA is available
 
 Output Files:
   walk_forward/folds.csv                 Per-fold metrics
@@ -58,6 +59,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.base_runner import PhaseRunner
 from scripts.run_phase7 import Phase7Runner
+from src.evaluation.audit import split_periodic_allocation_rows
 from src.evaluation.comparison import StrategyComparison
 from src.evaluation.metrics import compute_full_metrics
 from src.evaluation.walk_forward import WalkForwardValidator
@@ -71,13 +73,31 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
     def get_output_dir(self) -> Path:
         if self.args and self.args.output_dir:
             return Path(self.args.output_dir)
-        return self.op.root / "swarm_allocator_aco"
+        return self.op.swarm_aco.root
 
     def add_arguments(self, parser: argparse.ArgumentParser):
         parser.add_argument("--config-path", type=str, default=None, help="Path to best_config.json from factor search")
         parser.add_argument("--sample", type=int, default=None)
         parser.add_argument("--input-dir", type=str, default=None)
         parser.add_argument("--analysis-dir", type=str, default=None)
+        parser.add_argument("--phase2-cluster-filter", action="store_true")
+        parser.add_argument(
+            "--phase2-cluster-source",
+            type=str,
+            default="temporal_cumulative",
+            choices=["behavioral_family", "temporal_cumulative", "temporal_weekly", "temporal_monthly"],
+        )
+        parser.add_argument(
+            "--phase2-cluster-score-mode",
+            type=str,
+            default="return_low_vol",
+            choices=["return_low_vol", "return", "sharpe", "sortino"],
+        )
+        parser.add_argument("--phase2-cluster-top-k", type=int, default=1)
+        parser.add_argument("--phase2-cluster-min-size", type=int, default=20)
+        parser.add_argument("--phase2-cluster-min-return", type=float, default=0.01)
+        parser.add_argument("--phase2-cluster-max-vol", type=float, default=0.12)
+        parser.add_argument("--phase2-cluster-full-history", action="store_true")
         parser.add_argument("--start-date", type=str, default=None)
         parser.add_argument("--end-date", type=str, default=None)
         parser.add_argument("--train-window", type=int, default=252)
@@ -86,6 +106,7 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
         parser.add_argument("--step-size", type=int, default=63)
         parser.add_argument("--expanding", action="store_true")
         parser.add_argument("--max-folds", type=int, default=None)
+        parser.add_argument("--cpu-only", action="store_true")
 
     def run(self, args: argparse.Namespace) -> dict:
         phase7 = Phase7Runner()
@@ -110,6 +131,21 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
             )
             benchmark_returns = phase7._load_optional_benchmark_returns(input_dir)
             benchmark_weights = phase7._load_optional_benchmark_weights(input_dir, sampled_cols=sampled_cols)
+            if args.phase2_cluster_filter:
+                algo_returns, features, benchmark_weights, _ = phase7._apply_phase2_cluster_universe(
+                    algo_returns=algo_returns,
+                    features=features,
+                    benchmark_weights=benchmark_weights,
+                    analysis_dir=analysis_dir,
+                    output_dir=output_dir,
+                    source=args.phase2_cluster_source,
+                    score_mode=args.phase2_cluster_score_mode,
+                    top_k=args.phase2_cluster_top_k,
+                    min_size=args.phase2_cluster_min_size,
+                    min_return=args.phase2_cluster_min_return,
+                    max_vol=args.phase2_cluster_max_vol,
+                    latest_only=not args.phase2_cluster_full_history,
+                )
             family_labels = phase7._load_optional_family_labels(analysis_dir, algo_returns.columns, allow_default_fallback=True)
             family_alpha_scores = phase7._load_optional_family_alpha_scores(
                 analysis_dir,
@@ -144,6 +180,7 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
 
         with self.step("79.4 Run Walk-Forward Backtests"):
             fold_rows = []
+            allocation_rows = []
             stitched_portfolio = []
             stitched_benchmark = []
             for fold in folds:
@@ -190,25 +227,32 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
                         "validation_sharpe_ratio": float(val_metrics.get("sharpe_ratio", 0.0)),
                         "test_sharpe_ratio": float(test_metrics.get("sharpe_ratio", 0.0)),
                         "test_annualized_return": float(test_metrics.get("annualized_return", 0.0)),
-                        "test_benchmark_annualized_return": float(test_metrics.get("benchmark_annualized_return", 0.0)),
+                        "test_benchmark_annualized_volatility": float(test_metrics.get("benchmark_annualized_volatility", 0.0)),
                         "test_max_drawdown": float(test_metrics.get("max_drawdown", 0.0)),
-                        "test_information_ratio": float(test_metrics.get("information_ratio", 0.0)),
                         "test_portfolio_total_return": float(fold_comparison.get("portfolio_total_return", 0.0)),
-                        "test_benchmark_total_return": float(fold_comparison.get("benchmark_total_return", 0.0)),
-                        "test_excess_total_return": float(fold_comparison.get("excess_total_return", 0.0)),
-                        "test_annualized_return_delta": float(
-                            test_metrics.get("annualized_return", 0.0) - test_metrics.get("benchmark_annualized_return", 0.0)
-                        ),
-                        "test_sharpe_ratio_delta": float(
-                            test_metrics.get("sharpe_ratio", 0.0) - fold_comparison.get("benchmark_sharpe_ratio", 0.0)
-                        ),
-                        "test_max_drawdown_delta": float(
-                            test_metrics.get("max_drawdown", 0.0) - fold_comparison.get("benchmark_max_drawdown", 0.0)
-                        ),
-                        "test_tracking_error": float(test_metrics.get("tracking_error", 0.0)),
-                        "test_daily_hit_rate_vs_benchmark": float(fold_comparison.get("daily_hit_rate_vs_benchmark", 0.0)),
-                        "test_beat_benchmark_total_return": bool(fold_comparison.get("beat_benchmark_total_return", False)),
+                        "test_benchmark_max_drawdown": float(fold_comparison.get("benchmark_max_drawdown", 0.0)),
+                        "test_volatility_gap": float(fold_comparison.get("volatility_gap", 0.0)),
+                        "test_drawdown_gap": float(fold_comparison.get("drawdown_gap", 0.0)),
+                        "test_risk_alignment_score": float(fold_comparison.get("risk_alignment_score", 0.0)),
                     }
+                )
+                allocation_rows.extend(
+                    split_periodic_allocation_rows(
+                        result.weights.index,
+                        result.weights.to_numpy(dtype=float, copy=False),
+                        result.weights.columns.tolist(),
+                        split_windows=[
+                            ("train", fold["train_start"], fold["train_end"]),
+                            ("validation", fold["val_start"], fold["val_end"]),
+                            ("test", fold["test_start"], fold["test_end"]),
+                        ],
+                        final_period_end=fold["test_end"],
+                        metadata={
+                            "strategy": "aco_walk_forward",
+                            "fold_id": int(fold["fold_id"]),
+                            "selection_factor": selection_factor,
+                        },
+                    )
                 )
                 stitched_portfolio.append(test_returns)
                 if benchmark_test is not None:
@@ -217,7 +261,7 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
             stitched_portfolio_returns = self._stitch_returns(stitched_portfolio)
             stitched_benchmark_returns = self._stitch_returns(stitched_benchmark) if stitched_benchmark else None
 
-        with self.step("79.5 Compare vs Benchmark"):
+        with self.step("79.5 Build Risk Reference Summary"):
             comparison_table = pd.DataFrame()
             detailed_table = pd.DataFrame()
             benchmark_comparison = {}
@@ -245,6 +289,8 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
 
         folds_df = pd.DataFrame(fold_rows)
         folds_df.to_csv(folds_path, index=False)
+        if allocation_rows:
+            pd.DataFrame(allocation_rows).to_csv(wf_dir / "rebalance_allocations.csv", index=False)
         stitched_portfolio_returns.to_csv(portfolio_path, header=True)
         if stitched_benchmark_returns is not None and not stitched_benchmark_returns.empty:
             stitched_benchmark_returns.to_csv(benchmark_path, header=True)
@@ -258,11 +304,12 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
             "selection_factor": selection_factor,
             "n_folds": len(fold_rows),
             "overall_metrics": overall_metrics,
-            "benchmark_comparison": benchmark_comparison,
+            "risk_reference": benchmark_comparison,
+            "rebalance_allocations_path": str(wf_dir / "rebalance_allocations.csv") if allocation_rows else None,
             "mean_test_sharpe": float(folds_df["test_sharpe_ratio"].mean()) if not folds_df.empty else 0.0,
             "mean_test_return": float(folds_df["test_annualized_return"].mean()) if not folds_df.empty else 0.0,
-            "mean_test_benchmark_return": float(folds_df["test_benchmark_annualized_return"].mean()) if not folds_df.empty else 0.0,
-            "mean_test_information_ratio": float(folds_df["test_information_ratio"].mean()) if not folds_df.empty else 0.0,
+            "mean_test_benchmark_volatility": float(folds_df["test_benchmark_annualized_volatility"].mean()) if not folds_df.empty else 0.0,
+            "mean_test_risk_alignment_score": float(folds_df["test_risk_alignment_score"].mean()) if not folds_df.empty else 0.0,
             "mean_test_max_drawdown": float(folds_df["test_max_drawdown"].mean()) if not folds_df.empty else 0.0,
         }
         with open(summary_path, "w", encoding="utf-8") as handle:
@@ -322,8 +369,7 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
     def _build_aco_config(self, payload: dict) -> ACOConfig:
         valid_fields = {field.name for field in fields(ACOConfig)}
         config_kwargs = {key: value for key, value in payload.items() if key in valid_fields}
-        if "use_gpu" not in config_kwargs:
-            config_kwargs["use_gpu"] = False
+        config_kwargs["use_gpu"] = not getattr(self.args, "cpu_only", False)
         return ACOConfig(**config_kwargs)
 
     def _selection_factor_suffixes(self, selection_factor: str | list[str]) -> set[str]:
@@ -358,19 +404,31 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
         comparison.update(
             {
                 "benchmark_total_return": benchmark_total,
-                "benchmark_annualized_return": float(benchmark_metrics.get("annualized_return", 0.0)),
-                "benchmark_sharpe_ratio": float(benchmark_metrics.get("sharpe_ratio", 0.0)),
+                "benchmark_annualized_volatility": float(benchmark_metrics.get("annualized_volatility", 0.0)),
                 "benchmark_max_drawdown": float(benchmark_metrics.get("max_drawdown", 0.0)),
-                "excess_total_return": portfolio_total - benchmark_total,
-                "beat_benchmark_total_return": bool(portfolio_total > benchmark_total),
-                "daily_hit_rate_vs_benchmark": float((aligned["portfolio"] > aligned["benchmark"]).mean()),
+            }
+        )
+        portfolio_metrics = compute_full_metrics(aligned["portfolio"])
+        volatility_gap = float(
+            portfolio_metrics.get("annualized_volatility", 0.0)
+            - benchmark_metrics.get("annualized_volatility", 0.0)
+        )
+        drawdown_gap = float(
+            abs(portfolio_metrics.get("max_drawdown", 0.0))
+            - abs(benchmark_metrics.get("max_drawdown", 0.0))
+        )
+        comparison.update(
+            {
+                "volatility_gap": volatility_gap,
+                "drawdown_gap": drawdown_gap,
+                "risk_alignment_score": float(1.0 / (1.0 + abs(volatility_gap) + abs(drawdown_gap))),
             }
         )
         return comparison
 
     def _build_report(self, summary: dict, folds_df: pd.DataFrame, comparison_table: pd.DataFrame) -> str:
         overall = summary.get("overall_metrics", {})
-        benchmark = summary.get("benchmark_comparison", {})
+        benchmark = summary.get("risk_reference", {})
         lines = [
             "# Phase 7A Walk-Forward Summary",
             "",
@@ -378,8 +436,8 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
             f"Folds: {summary['n_folds']}",
             f"Mean test Sharpe: {summary['mean_test_sharpe']:.3f}",
             f"Mean test annualized return: {summary['mean_test_return']:.2%}",
-            f"Mean benchmark annualized return: {summary['mean_test_benchmark_return']:.2%}",
-            f"Mean test information ratio: {summary['mean_test_information_ratio']:.3f}",
+            f"Mean benchmark volatility reference: {summary['mean_test_benchmark_volatility']:.2%}",
+            f"Mean risk alignment score: {summary['mean_test_risk_alignment_score']:.3f}",
             f"Mean test max drawdown: {summary['mean_test_max_drawdown']:.2%}",
             "",
             "## Overall Out-of-Sample Metrics",
@@ -392,10 +450,6 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
             ("Sortino Ratio", overall.get("sortino_ratio", 0.0), "num"),
             ("Calmar Ratio", overall.get("calmar_ratio", 0.0), "num"),
             ("Max Drawdown", overall.get("max_drawdown", 0.0), "pct"),
-            ("Tracking Error", overall.get("tracking_error", 0.0), "pct"),
-            ("Information Ratio", overall.get("information_ratio", 0.0), "num"),
-            ("Alpha vs Benchmark", overall.get("alpha_vs_benchmark", 0.0), "pct"),
-            ("Beta vs Benchmark", overall.get("beta_vs_benchmark", 0.0), "num"),
         ]
         lines.extend(
             [
@@ -409,36 +463,21 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
             lines.extend(
                 [
                     "",
-                    "## Benchmark Comparison",
+                    "## Risk Reference",
                     "",
-                    "| Metric | ACO Walk-Forward | Benchmark | Delta |",
-                    "|--------|------------------|-----------|-------|",
+                    "| Metric | ACO Walk-Forward | Benchmark Reference | Gap |",
+                    "|--------|------------------|---------------------|-----|",
                     (
-                        f"| Total Return | {self._format_metric_value(benchmark.get('portfolio_total_return', 0.0), 'pct')} | "
-                        f"{self._format_metric_value(benchmark.get('benchmark_total_return', 0.0), 'pct')} | "
-                        f"{self._format_metric_value(benchmark.get('excess_total_return', 0.0), 'pct')} |"
-                    ),
-                    (
-                        f"| Annualized Return | {self._format_metric_value(overall.get('annualized_return', 0.0), 'pct')} | "
-                        f"{self._format_metric_value(benchmark.get('benchmark_annualized_return', 0.0), 'pct')} | "
-                        f"{self._format_metric_value(overall.get('annualized_return', 0.0) - benchmark.get('benchmark_annualized_return', 0.0), 'pct')} |"
-                    ),
-                    (
-                        f"| Sharpe Ratio | {self._format_metric_value(overall.get('sharpe_ratio', 0.0), 'num')} | "
-                        f"{self._format_metric_value(benchmark.get('benchmark_sharpe_ratio', 0.0), 'num')} | "
-                        f"{self._format_metric_value(overall.get('sharpe_ratio', 0.0) - benchmark.get('benchmark_sharpe_ratio', 0.0), 'num')} |"
+                        f"| Annualized Volatility | {self._format_metric_value(overall.get('annualized_volatility', 0.0), 'pct')} | "
+                        f"{self._format_metric_value(benchmark.get('benchmark_annualized_volatility', 0.0), 'pct')} | "
+                        f"{self._format_metric_value(benchmark.get('volatility_gap', 0.0), 'pct')} |"
                     ),
                     (
                         f"| Max Drawdown | {self._format_metric_value(overall.get('max_drawdown', 0.0), 'pct')} | "
                         f"{self._format_metric_value(benchmark.get('benchmark_max_drawdown', 0.0), 'pct')} | "
-                        f"{self._format_metric_value(overall.get('max_drawdown', 0.0) - benchmark.get('benchmark_max_drawdown', 0.0), 'pct')} |"
+                        f"{self._format_metric_value(benchmark.get('drawdown_gap', 0.0), 'pct')} |"
                     ),
-                    (
-                        f"| Daily Hit Rate vs Benchmark | {self._format_metric_value(benchmark.get('daily_hit_rate_vs_benchmark', 0.0), 'pct')} | - | - |"
-                    ),
-                    (
-                        f"| Beat Benchmark by Total Return | {'Yes' if benchmark.get('beat_benchmark_total_return', False) else 'No'} | - | - |"
-                    ),
+                    f"| Risk Alignment Score | {self._format_metric_value(benchmark.get('risk_alignment_score', 0.0), 'num')} | - | - |",
                 ]
             )
         if not folds_df.empty:
@@ -454,7 +493,7 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
             lines.extend(
                 [
                     "",
-                    "## Benchmark Comparison",
+                    "## Comparison Table",
                     "",
                     comparison_table.to_markdown(),
                 ]
@@ -472,7 +511,7 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
 
     def _print_summary(self, summary: dict, comparison_table: pd.DataFrame):
         overall = summary.get("overall_metrics", {})
-        benchmark = summary.get("benchmark_comparison", {})
+        benchmark = summary.get("risk_reference", {})
 
         self.logger.info("")
         self.logger.info("=" * 80)
@@ -483,28 +522,21 @@ class Phase7ACOWalkForwardRunner(PhaseRunner):
             self._format_selection_factor(summary.get("selection_factor", "")),
         )
         self.logger.info(
-            "Out-of-sample: return=%s | vol=%s | sharpe=%.3f | max_dd=%s | ir=%.3f",
+            "Out-of-sample: return=%s | vol=%s | sharpe=%.3f | max_dd=%s",
             self._format_metric_value(overall.get("annualized_return", 0.0), "pct"),
             self._format_metric_value(overall.get("annualized_volatility", 0.0), "pct"),
             float(overall.get("sharpe_ratio", 0.0)),
             self._format_metric_value(overall.get("max_drawdown", 0.0), "pct"),
-            float(overall.get("information_ratio", 0.0)),
         )
         if benchmark:
             self.logger.info(
-                "Benchmark: return=%s | sharpe=%.3f | max_dd=%s | hit_rate=%s",
-                self._format_metric_value(benchmark.get("benchmark_annualized_return", 0.0), "pct"),
-                float(benchmark.get("benchmark_sharpe_ratio", 0.0)),
+                "Benchmark risk anchor: vol=%s | max_dd=%s | score=%.3f",
+                self._format_metric_value(benchmark.get("benchmark_annualized_volatility", 0.0), "pct"),
                 self._format_metric_value(benchmark.get("benchmark_max_drawdown", 0.0), "pct"),
-                self._format_metric_value(benchmark.get("daily_hit_rate_vs_benchmark", 0.0), "pct"),
-            )
-            self.logger.info(
-                "Comparison: total_return_delta=%s | beat_benchmark=%s",
-                self._format_metric_value(benchmark.get("excess_total_return", 0.0), "pct"),
-                benchmark.get("beat_benchmark_total_return", False),
+                float(benchmark.get("risk_alignment_score", 0.0)),
             )
         if not comparison_table.empty:
-            self.logger.info("Comparison table saved with benchmark metrics.")
+            self.logger.info("Comparison table saved.")
         self.logger.info("=" * 80)
 
     def _format_selection_factor(self, selection_factor: str | list[str]) -> str:

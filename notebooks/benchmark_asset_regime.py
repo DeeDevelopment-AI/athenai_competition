@@ -46,6 +46,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from notebook_paths import default_output_dir, notebook_data_path, raw_benchmark_path, raw_path
 try:
     from algo_pipeline import load_algorithm_csv, trim_dead_tail, load_all_benchmarks
 except:
@@ -661,12 +662,15 @@ def train_regime_model(features, regimes, sp500_daily):
 
 def main():
     parser = argparse.ArgumentParser(description='Benchmark asset analysis + SP500 regime detection')
-    parser.add_argument('--trades', required=True)
-    parser.add_argument('--inference', required=True, help='asset_inference_all.csv')
-    parser.add_argument('--metrics', required=True, help='metrics_all.csv')
-    parser.add_argument('--clusters', default=None, help='clusters.csv (optional)')
-    parser.add_argument('--benchmarks', required=True, help='benchmarks directory')
-    parser.add_argument('--output', default='results/regime')
+    parser.add_argument('--trades', default=str(raw_benchmark_path('trades_benchmark.csv')))
+    parser.add_argument('--inference', default=str(notebook_data_path('pipeline', 'asset_inference_all.csv')),
+                        help='asset_inference_all.csv')
+    parser.add_argument('--metrics', default=str(notebook_data_path('pipeline', 'metrics_all.csv')),
+                        help='metrics_all.csv')
+    parser.add_argument('--clusters', default=str(notebook_data_path('clusters', 'clusters.csv')),
+                        help='clusters.csv (optional)')
+    parser.add_argument('--benchmarks', default=str(raw_path()), help='benchmarks directory')
+    parser.add_argument('--output', default=str(default_output_dir('regime')))
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)

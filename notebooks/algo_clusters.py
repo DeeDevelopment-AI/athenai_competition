@@ -31,6 +31,8 @@ import argparse
 import warnings
 warnings.filterwarnings('ignore')
 
+from notebook_paths import default_output_dir, notebook_data_path
+
 
 # ============================================================
 # 1. LOAD PIPELINE RESULTS
@@ -435,12 +437,13 @@ def export_dashboard_json(df_feat, profiles, feature_cols, loadings,
 
 def main():
     parser = argparse.ArgumentParser(description='Cluster and compare trading algorithms')
-    parser.add_argument('--input', required=True, help='Directory with pipeline output (metrics_all.csv, etc.)')
-    parser.add_argument('--output', default=None, help='Output directory (default: same as input)')
+    parser.add_argument('--input', default=str(notebook_data_path('pipeline')),
+                        help='Directory with pipeline output (metrics_all.csv, etc.)')
+    parser.add_argument('--output', default=str(default_output_dir('clusters')), help='Output directory')
     parser.add_argument('--n-clusters', type=int, default=None, help='Number of clusters (auto if omitted)')
     args = parser.parse_args()
 
-    output_dir = args.output or args.input
+    output_dir = args.output
     os.makedirs(output_dir, exist_ok=True)
 
     # 1. Load

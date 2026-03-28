@@ -64,6 +64,8 @@ class GPUEnvConfig:
     cost_penalty: float = 1.0
     turnover_penalty: float = 0.1
     drawdown_penalty: float = 0.5
+    risk_penalty: float = 0.2
+    risk_tolerance: float = 1.2
     # Observation lookback
     obs_lookback: int = 21
     # Activity window for alive mask
@@ -100,7 +102,7 @@ class GPUVecTradingEnv(VecEnv):
         self._n_total_algos = len(algo_returns.columns)
 
         # Observation and action spaces (family-level)
-        obs_dim = family_encoder.obs_dim  # n_families * 5 + 3
+        obs_dim = family_encoder.obs_dim  # n_families * 5 + 4
         act_dim = family_encoder.action_dim  # n_families
         observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
         action_space = spaces.Box(-1.0, 1.0, shape=(act_dim,), dtype=np.float32)
@@ -413,11 +415,16 @@ class GPUVecTradingEnv(VecEnv):
         drawdown = self._compute_drawdowns()  # (n_envs,)
         excess = (self._portfolio_values / self._benchmark_values.clamp(min=1e-8)) - 1.0
         avg_corr = torch.zeros(n_envs, device=self.device)
+        # Fraction of alive algos with positive 5d return (momentum breadth).
+        # Matches the 4th scalar in FamilyEncoder.encode_obs so obs_dim = n_families*5+4.
+        alive_count = alive_masks.float().sum(dim=1).clamp(min=1.0)
+        momentum_breadth = ((ret5d_batch > 0).float() * alive_masks.float()).sum(dim=1) / alive_count
 
-        # Concatenate: (n_envs, n_families*5 + 3)
+        # Concatenate: (n_envs, n_families*5 + 4)
         obs = torch.cat([
             fam_ret5d, fam_ret21d, fam_vol, fam_weights, fam_active_frac,
             avg_corr.unsqueeze(1), drawdown.unsqueeze(1), excess.unsqueeze(1),
+            momentum_breadth.unsqueeze(1),
         ], dim=1)
 
         return torch.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -508,18 +515,17 @@ class GPUVecTradingEnv(VecEnv):
         port_vols: torch.Tensor,
         bench_vols: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute ALPHA_PENALIZED rewards for all envs. Returns (n_envs,)."""
+        """Compute absolute-return rewards with risk calibration. Returns (n_envs,)."""
         cfg = self.config
-
-        # Alpha = portfolio return - benchmark return
-        alpha = portfolio_returns - benchmark_returns
 
         # Penalties
         cost_pen = cfg.cost_penalty * costs
         turn_pen = cfg.turnover_penalty * turnovers
         dd_pen = cfg.drawdown_penalty * drawdowns.abs()
+        max_allowed_vol = bench_vols * cfg.risk_tolerance
+        risk_pen = cfg.risk_penalty * torch.relu(port_vols - max_allowed_vol)
 
-        reward = (alpha - cost_pen - turn_pen - dd_pen) * cfg.reward_scale
+        reward = (portfolio_returns - cost_pen - turn_pen - dd_pen - risk_pen) * cfg.reward_scale
 
         # NaN safety
         reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)

@@ -19,18 +19,20 @@ from src.environment import (
 )
 
 
-# Path to processed data
+# Path to processed data (new subdirectory layout)
 DATA_PATH = Path(__file__).parent.parent.parent / "data" / "processed"
+ALGO_PATH = DATA_PATH / "algorithms"
+BENCH_PATH = DATA_PATH / "benchmark"
 
 
 def data_exists() -> bool:
     """Check if processed data files exist."""
     required_files = [
-        "algo_returns.parquet",
-        "benchmark_weights.parquet",
-        "benchmark_daily_returns.csv",
+        ALGO_PATH / "returns.parquet",
+        BENCH_PATH / "weights.parquet",
+        BENCH_PATH / "daily_returns.csv",
     ]
-    return all((DATA_PATH / f).exists() for f in required_files)
+    return all(f.exists() for f in required_files)
 
 
 def normalize_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -47,7 +49,7 @@ def real_algo_returns():
     if not data_exists():
         pytest.skip("Processed data not available")
 
-    returns = pd.read_parquet(DATA_PATH / "algo_returns.parquet")
+    returns = pd.read_parquet(ALGO_PATH / "returns.parquet")
     returns = normalize_index(returns)
     return returns
 
@@ -58,7 +60,7 @@ def real_benchmark_weights():
     if not data_exists():
         pytest.skip("Processed data not available")
 
-    weights = pd.read_parquet(DATA_PATH / "benchmark_weights.parquet")
+    weights = pd.read_parquet(BENCH_PATH / "weights.parquet")
     weights = normalize_index(weights)
     return weights
 
@@ -69,7 +71,7 @@ def real_benchmark_returns():
     if not data_exists():
         pytest.skip("Processed data not available")
 
-    returns = pd.read_csv(DATA_PATH / "benchmark_daily_returns.csv", index_col=0, parse_dates=True)
+    returns = pd.read_csv(BENCH_PATH / "daily_returns.csv", index_col=0, parse_dates=True)
     return returns
 
 
