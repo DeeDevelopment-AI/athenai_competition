@@ -578,7 +578,19 @@ class FastBacktester:
         weights_matrix: np.ndarray,
         rebalance_indices: np.ndarray,
     ) -> np.ndarray:
-        """Compute portfolio returns with rebalancing."""
+        """
+        Compute portfolio returns with rebalancing (lookahead-free).
+
+        Timing convention (matches MarketSimulator):
+        - On rebalance day T, we observe data up to T and compute new weights
+        - Those weights apply to returns starting from day T+1, NOT day T
+        - This avoids lookahead bias: decision at T cannot use T's return
+
+        Example:
+        - Day 0: rebalance, observe factors, compute weights → weights apply day 1+
+        - Day 0 return: 0 (no position yet, or use prior weights)
+        - Day 1 return: dot(new_weights, returns[1])
+        """
         n_days, n_algos = returns_matrix.shape
         portfolio_returns = np.zeros(n_days, dtype=np.float64)
 
@@ -589,11 +601,15 @@ class FastBacktester:
         reb_ptr = 0
 
         for day in range(n_days):
+            # FIRST: compute this day's return with CURRENT weights (before update)
+            # This ensures rebalance day T uses old weights, new weights apply T+1
+            portfolio_returns[day] = np.dot(current_weights, returns_matrix[day])
+
+            # THEN: update weights if this is a rebalance day
+            # New weights will take effect starting TOMORROW
             if reb_ptr < len(rebalance_indices) and day == rebalance_indices[reb_ptr]:
                 current_weights = weights_matrix[reb_ptr]
                 reb_ptr += 1
-
-            portfolio_returns[day] = np.dot(current_weights, returns_matrix[day])
 
         return portfolio_returns
 
