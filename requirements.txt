@@ -45,6 +45,7 @@ quantstats # Install separately if compatible with your Python version
 # Data handling
 pyarrow>=12.0              # Para parquet
 pyyaml>=6.0                # Para configs
+Nasdaq-Data-Link>=1.0.4
 
 # Testing
 pytest>=7.0

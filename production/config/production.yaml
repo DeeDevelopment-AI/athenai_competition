@@ -1,0 +1,94 @@
+# Production Configuration for RL Meta-Allocator
+# ================================================
+
+# Data source configuration
+# Choose one: duckdb OR csv (raw_dir)
+data:
+  # DuckDB source (recommended for large datasets)
+  duckdb_path: null             # Path to DuckDB file (e.g., "/path/to/prices.duckdb")
+  duckdb_table: null            # Table name (auto-detected if null)
+
+  # CSV source (alternative)
+  raw_dir: "data/raw"           # Directory with OHLCV CSVs
+
+  # Output
+  processed_dir: "data/processed"
+
+  # Filtering
+  start_date: null              # Start date filter (YYYY-MM-DD)
+  end_date: null                # End date filter (YYYY-MM-DD)
+
+# Model paths
+models:
+  base_dir: "models"
+  latest_link: "models/latest"   # Symlink to latest trained model
+
+# Output paths
+outputs:
+  recommendations_dir: "outputs/recommendations"
+  logs_dir: "outputs/logs"
+
+# Data preprocessing
+preprocessing:
+  date_column: "date"            # Name of date column in CSVs (case-insensitive)
+  ohlcv_columns:                 # Expected columns (case-insensitive)
+    open: "open"
+    high: "high"
+    low: "low"
+    close: "close"
+    volume: "volume"
+  min_history_days: 252          # Minimum days required per asset
+
+# Feature engineering
+features:
+  rolling_windows: [5, 21, 63]   # Days for rolling calculations
+  use_cross_sectional: true      # Include cross-sectional features
+
+# Training configuration
+training:
+  agent: "ppo"                   # ppo, sac, or td3
+  total_timesteps: 100000
+  learning_rate: 0.0001
+  net_arch: [256, 256]
+  n_envs: 4                      # Parallel environments
+
+  # Walk-forward parameters
+  train_window_days: 504         # ~2 years training
+  val_window_days: 63            # ~3 months validation
+
+  # Encoder settings
+  use_encoder: true
+  n_pca_components: 20           # Lower than dev (fewer assets)
+
+  # Hybrid mode (recommended)
+  hybrid_mode: true
+  base_allocator: "risk_parity"
+  max_tilt: 0.15                 # Max deviation from base
+
+# Constraints (applied during training and inference)
+constraints:
+  max_weight: 0.40               # Max 40% in any single asset
+  min_weight: 0.00               # No short selling
+  max_turnover: 0.30             # Max 30% turnover per rebalance
+  max_exposure: 1.0              # Fully invested
+
+# Cost model (realistic transaction costs)
+costs:
+  spread_bps: 5                  # 5 basis points spread
+  slippage_bps: 2                # 2 basis points slippage
+  market_impact_coef: 0.1        # Market impact coefficient
+
+# Reward function
+reward:
+  type: "pure_returns"
+  scale: 100.0
+  cost_penalty: 1.0
+  turnover_penalty: 0.005
+  drawdown_penalty: 0.1
+  bad_family_penalty: 2.0    # Penalize allocations to Moderate/Poor families (Sortino < 1)
+
+# Inference settings
+inference:
+  rebalance_day: "friday"        # Day to generate recommendations
+  lookback_days: 63              # Days of data to use for features
+  deterministic: true            # No exploration during inference

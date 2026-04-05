@@ -447,6 +447,8 @@ class FamilyEncoder:
         # Alive mask cache (per step)
         self._alive_cache_date: Optional[np.datetime64] = None
         self._alive_cache_mask: Optional[np.ndarray] = None
+        # Store column names for inference-time alignment
+        self._trained_columns: Optional[list] = None
 
     # ------------------------------------------------------------------
     # Fit
@@ -466,6 +468,8 @@ class FamilyEncoder:
         algo_returns = algo_returns.sort_index()
         self._n_total_algos = len(algo_returns.columns)
         self._returns_index_np = algo_returns.index.values
+        # Store column names for inference-time alignment
+        self._trained_columns = list(algo_returns.columns)
 
         # Map family labels to column positions
         self._algo_to_family = np.full(self._n_total_algos, -1, dtype=np.intp)
@@ -527,6 +531,12 @@ class FamilyEncoder:
     @property
     def n_total_algos(self) -> int:
         return self._n_total_algos
+
+    @property
+    def trained_columns(self) -> list:
+        """Return the column names from training data (for inference-time alignment)."""
+        self._check_fitted()
+        return self._trained_columns
 
     # ------------------------------------------------------------------
     # Stage 2: Dynamic alive mask

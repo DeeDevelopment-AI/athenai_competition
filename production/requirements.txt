@@ -1,0 +1,24 @@
+# Production dependencies for RL Meta-Allocator
+# Install: pip install -r production/requirements.txt
+
+# Core
+numpy>=1.24.0
+pandas>=2.0.0
+pyarrow>=12.0.0           # For parquet support
+
+# Data loading
+duckdb>=0.9.0             # DuckDB database support
+
+# ML/RL
+torch>=2.0.0
+stable-baselines3>=2.0.0
+gymnasium>=0.29.0
+
+# Optimization
+numba>=0.58.0             # JIT compilation for features
+
+# Configuration
+pyyaml>=6.0
+
+# Optional: Progress bars
+tqdm>=4.65.0

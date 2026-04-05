@@ -66,6 +66,8 @@ class GPUEnvConfig:
     drawdown_penalty: float = 0.5
     risk_penalty: float = 0.2
     risk_tolerance: float = 1.2
+    # Family-based penalties (penalize allocations to Moderate/Poor families)
+    bad_family_penalty: float = 2.0  # Penalty multiplier for families 2,3
     # Observation lookback
     obs_lookback: int = 21
     # Activity window for alive mask
@@ -669,6 +671,29 @@ class GPUVecTradingEnv(VecEnv):
             portfolio_returns, benchmark_returns, costs, turnovers,
             drawdowns, port_vols, bench_vols,
         )
+
+        # 8b. Penalize allocations to bad families (Moderate=2, Poor=3)
+        # Only applies if we have all 4 families in action space
+        if self.config.bad_family_penalty > 0 and self._n_families >= 4:
+            # Clip negative actions to 0 first (agent shouldn't short families)
+            clipped_actions = torch.clamp(actions, min=0)
+            # Sum of allocations to families 2 and 3
+            bad_family_weight = clipped_actions[:, 2] + clipped_actions[:, 3]
+            # Normalize by total allocation
+            total_weight = clipped_actions.sum(dim=1).clamp(min=1e-8)
+            bad_family_frac = bad_family_weight / total_weight
+            # Penalize proportionally
+            bad_family_pen = self.config.bad_family_penalty * bad_family_frac * self.config.reward_scale
+            rewards = rewards - bad_family_pen
+        elif self.config.bad_family_penalty > 0 and self._n_families == 3:
+            # Only family 2 (Moderate) is "bad" if we have 3 families
+            clipped_actions = torch.clamp(actions, min=0)
+            bad_family_weight = clipped_actions[:, 2]
+            total_weight = clipped_actions.sum(dim=1).clamp(min=1e-8)
+            bad_family_frac = bad_family_weight / total_weight
+            bad_family_pen = self.config.bad_family_penalty * bad_family_frac * self.config.reward_scale
+            rewards = rewards - bad_family_pen
+        # If n_families <= 2, no bad families to penalize (all are Good or Excellent)
 
         # 9. Handle episode endings (auto-reset with SB3 protocol)
         terminated = dones
