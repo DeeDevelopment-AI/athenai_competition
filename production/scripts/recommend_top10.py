@@ -360,6 +360,50 @@ def main():
         encoder = pickle.load(f)
     logger.info(f"Encoder loaded: {encoder._n_families} families")
 
+    # Align returns columns with encoder's trained columns
+    # This handles the case where new assets were added after model training
+    if hasattr(encoder, '_trained_columns') and encoder._trained_columns is not None:
+        trained_cols = encoder._trained_columns
+        common_cols = [c for c in trained_cols if c in returns.columns]
+        if len(common_cols) < len(trained_cols):
+            logger.warning(
+                f"Missing {len(trained_cols) - len(common_cols)} columns from training data. "
+                f"Reindexing to {len(trained_cols)} trained columns."
+            )
+        returns = returns.reindex(columns=trained_cols)
+        logger.info(f"Aligned returns to encoder: {returns.shape[1]} columns")
+    else:
+        # Fallback for older encoders without _trained_columns
+        logger.warning(
+            "Encoder was trained with older version (no _trained_columns). "
+            "Attempting to infer columns from family_labels..."
+        )
+        if hasattr(encoder, 'family_labels') and encoder.family_labels is not None:
+            trained_cols = list(encoder.family_labels.index)
+            if len(trained_cols) == encoder._n_total_algos:
+                common_cols = [c for c in trained_cols if c in returns.columns]
+                logger.info(
+                    f"Inferred {len(trained_cols)} columns from family_labels, "
+                    f"{len(common_cols)} present in current data"
+                )
+                returns = returns.reindex(columns=trained_cols)
+                logger.info(f"Aligned returns to encoder: {returns.shape[1]} columns")
+            else:
+                raise RuntimeError(
+                    f"Column count mismatch: encoder expects {encoder._n_total_algos} columns, "
+                    f"but family_labels has {len(trained_cols)}. Please retrain the model."
+                )
+        elif encoder._n_total_algos != returns.shape[1]:
+            raise RuntimeError(
+                f"Column count mismatch: encoder expects {encoder._n_total_algos} columns, "
+                f"but returns has {returns.shape[1]}. Please retrain the model with --force-retrain."
+            )
+
+    # Update available_assets and family_labels to only include those in aligned returns
+    available_assets = [a for a in available_assets if a in returns.columns]
+    family_labels = family_labels[[a for a in family_labels.index if a in available_assets]]
+    logger.info(f"Available assets after alignment: {len(available_assets)}")
+
     # Create environment to get observation
     n_assets = returns.shape[1]
     benchmark_weights = pd.DataFrame(
